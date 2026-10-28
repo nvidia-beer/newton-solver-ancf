@@ -263,20 +263,13 @@ uses conservative ANS without EAS. Cable curvature regularization, exact local
 cable Hessians, pressure/contact laws, sparse PCG and implicit gradients are
 additional implementation details, not claims made by that white paper.
 
-## HHT and sparse topology updates
+## HHT time integration
 
 [Hilber, Hughes and Taylor (1977)](https://doi.org/10.1002/eqe.4290050306) maps to
 [`implicit/hht.py`](src/newton_solver_ancf/_src/solvers/implicit/hht.py):
 `predict_position`, `predict_velocity`, `weighted_residual`, `mass_scale` and
 `stiffness_scale`. The [method](docs/method.md) states the implemented equations and
 adjoint assumptions.
-
-[Acharya and Hyde (2026), STA-FEM](https://arxiv.org/abs/2605.11673), §3.7
-Algorithm 1, maintains a matrix under preplanned element additions/removals.
-ANCF does not implement that topology-edit loop: its sparse pattern is fixed,
-and nonlinear element contributions are recomputed as coordinates change.
-[`implicit/sparse.py`](src/newton_solver_ancf/_src/solvers/implicit/sparse.py)
-provides sparse storage and solves, not streaming deletion/addition bookkeeping.
 
 ## Examples
 
