@@ -13,6 +13,7 @@ license-files = ["LICENSE", "THIRD_PARTY_NOTICES.txt"]
 dependencies = ["newton==1.7.0", "warp-lang==1.17.0", "numpy>=2,<3", "scipy>=1.14,<2"]
 
 [project.optional-dependencies]
+profiling = ["nvtx>=0.2.13,<0.3"]
 examples = ["usd-exchange>=2.2,<3; sys_platform == 'linux' and platform_machine == 'aarch64'", "usd-core>=25.5,<27; sys_platform != 'linux' or platform_machine != 'aarch64'", "newton[sim]==1.7.0", "newton-usd-schemas>=0.5.0", "pyglet>=2.1.6,<3", "imgui-bundle>=1.92,<2", "Pillow>=11.3", "PyOpenGL>=3.1.9,<4"]
 
 [dependency-groups]
