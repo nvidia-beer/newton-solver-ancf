@@ -1,0 +1,2556 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+"""
+SolverANCFTire — implicit HHT time integrator for ANCF3423 shell elements.
+
+Integration scheme: Hilber-Hughes-Taylor (HHT-alpha), parameters:
+    alpha = -0.2  (high-frequency numerical damping)
+    beta  = (1 - alpha)^2 / 4 = 0.36
+    gamma = (1 - 2*alpha)  / 2 = 0.70
+
+HHT residual per Newton-Raphson iteration:
+    R = M·a_{n+1} + (1+α)·(f_int − f_ext)_{n+1} − α·(f_int − f_ext)_n = 0
+
+Kinematic update from current acceleration a = q̈_{n+1}:
+    x_{n+1} = x_pred + β·dt²·a
+    v_{n+1} = v_pred + γ·dt·a
+    x_pred  = x_n + dt·v_n + dt²·(0.5-β)·a_n
+    v_pred  = v_n + dt·(1-γ)·a_n
+
+Effective stiffness:
+    K_eff = (1/(β·dt²))·M + (1+α)·K_t
+
+Notes:
+    - ANCF state (node_x, node_D, velocities, accelerations) is managed
+      internally by the solver, not stored in Newton's State object.
+    - The Newton Model/State/Control objects are accepted by step() to comply
+      with SolverBase, but only gravity is read from the model.
+    - Rigid-body hub coupling: bead nodes are pinned with set_dirichlet_nodes()
+      and driven by the caller; SolverANCFShellRigid feeds the tire load back to
+      MuJoCo spindle bodies (see also newton_solver_ancf.InterfaceCouplerGS).
+"""
+
+import math
+import sys
+import threading
+import time
+
+import numpy as np
+import warp as wp
+from newton import Contacts, Control, Model, State
+from newton.solvers import SolverBase
+
+from ..implicit.hht import (
+    HHT_ALPHA,
+    HHT_BETA,
+    HHT_GAMMA,
+    build_residual,
+    hht_kinematic,
+    hht_predict,
+    stiffness_scale,
+)
+from ..implicit.hht import (
+    apply_acceleration_update as _apply_acceleration_update,
+)
+from ..implicit.hht import (
+    dirichlet_pred_override as _dirichlet_pred_override,
+)
+from . import kernels_coarse, kernels_gather, kernels_pcg
+from .kernels_assembly import (
+    add_blk_to_blk_values_batched,
+    add_diag_to_blk_values_batched,
+    assemble_sparse_stiffness,
+    build_block_structure,
+    cavity_gas_law,
+    cavity_gas_law_circuit,
+    compute_pressure_force_stiffness,
+)
+from .kernels_coarse import _to_double
+from .kernels_contact import (
+    apply_ground_contact,
+    apply_ground_contact_batched,
+    zero_contact_blk,
+    zero_contact_diag,
+)
+from .kernels_element import compute_lumped_mass
+from .kernels_stiffness import (
+    compute_element_forces_stiffness,
+    compute_element_forces_stiffness_batched_gp,
+    compute_element_K_from_B,
+    compute_rest_jacobians,
+    sum_element_quadrature_forces,
+)
+from .shell_model import ANCFShellModel
+
+wp.set_module_options({"enable_backward": False})
+
+# ---------------------------------------------------------------------------
+# PCG linear solver
+#
+# PcgSolverBatched solves N independent systems sharing one sparsity pattern.
+# K is stored as 6x6 node blocks (node-block CSR + flat values, see build_block_structure).
+# Per-iteration kernel sequence:
+#   1. _pcg_mv_p_update_blk_batched — p=z+βp, Ap=K·p, pAp+=p·Ap (thread/row, tile-reduced); zeroes next r·z
+#   2. _pcg_update_xrz_blk_batched  — x,r,z update + r·z (thread/row, tile-reduced); zeroes next pAp
+# No memset nodes inside the loop (accumulators are zeroed by the preceding kernel).
+#
+# Preconditioner: 6x6 block Jacobi (inverse of each node's diagonal block of K_eff).
+# The six DOFs of an ANCF node (position + h/2-scaled gradient) have diagonal
+# entries orders of magnitude apart and are strongly coupled, which scalar Jacobi
+# cannot capture; an under-converged solve injects energy into the HHT step.
+#
+# n_chunks = n_dof_pad/128: all tile launches use N*n_chunks blocks so every SM is busy.
+# ---------------------------------------------------------------------------
+
+TILE_PCG = wp.constant(128)  # block size for tile-based PCG kernels
+
+_mat66 = wp.types.matrix(shape=(6, 6), dtype=wp.float32)
+
+
+@wp.kernel
+def _extract_blockdiag_inv_batched(
+    blk_offsets: wp.array[wp.int32],
+    blk_columns: wp.array[wp.int32],
+    values: wp.array[float],
+    binv: wp.array[float],  # (N*n_nodes*36,) row-major 6x6 inverse per node
+    n_nodes: int,
+    nnz: int,
+    repeats: int,
+):
+    """dim = N*n_nodes.  Invert each node's 6x6 diagonal block of K_eff (Gauss-Jordan).
+
+    K_eff diagonal blocks are SPD (lumped mass/(β dt²) + K), so no pivoting is
+    needed; a non-positive pivot falls back to the scalar-Jacobi inverse of the
+    remaining rows so a degenerate block can never poison the whole solve.
+    """
+    tid = wp.tid()
+    env = (tid // n_nodes) * repeats
+    node = tid % n_nodes
+    base_out = (env * n_nodes + node) * 36
+
+    A = _mat66()
+    B = _mat66()
+    found = int(0)
+    for b in range(blk_offsets[node], blk_offsets[node + 1]):
+        if blk_columns[b] == node:
+            base = env * nnz + b * 36
+            for rr in range(6):
+                for cc in range(6):
+                    A[rr, cc] = values[base + rr * 6 + cc]
+                    B[rr, cc] = float(0.0)
+                B[rr, rr] = float(1.0)
+            found = 1
+    if found == 0:
+        for rr in range(6):
+            for cc in range(6):
+                binv[base_out + rr * 6 + cc] = float(0.0)
+            binv[base_out + rr * 7] = float(1.0)
+        return
+
+    ok = int(1)
+    for k in range(6):
+        if ok == 1:
+            piv = A[k, k]
+            if piv <= 1.0e-30:
+                # Degenerate block: scalar Jacobi on this and the remaining rows.
+                ok = 0
+                for rr in range(k, 6):
+                    for cc in range(6):
+                        B[rr, cc] = float(0.0)
+                    d = A[rr, rr]
+                    B[rr, rr] = 1.0 / d if wp.abs(d) > 1.0e-30 else float(1.0)
+            else:
+                inv_piv = 1.0 / piv
+                for cc in range(6):
+                    A[k, cc] = A[k, cc] * inv_piv
+                    B[k, cc] = B[k, cc] * inv_piv
+                for rr in range(6):
+                    if rr != k:
+                        f = A[rr, k]
+                        for cc in range(6):
+                            A[rr, cc] = A[rr, cc] - f * A[k, cc]
+                            B[rr, cc] = B[rr, cc] - f * B[k, cc]
+
+    for rr in range(6):
+        for cc in range(6):
+            binv[base_out + rr * 6 + cc] = B[rr, cc]
+
+
+@wp.kernel
+def _apply_block_precond(
+    binv: wp.array[float],
+    r: wp.array[float],
+    z: wp.array[float],
+    n_dof: int,
+    n_dof_pad: int,
+    repeats: int,
+):
+    """dim = N*n_dof_pad.  z = blockdiag(K)^-1 r on the padded layout (padded rows -> 0)."""
+    tid = wp.tid()
+    env = tid // n_dof_pad
+    i = tid % n_dof_pad
+    if i >= n_dof:
+        z[tid] = float(0.0)
+        return
+    node = i // 6
+    s = i % 6
+    matrix_env = (env // repeats) * repeats
+    row = (matrix_env * (n_dof // 6) + node) * 36 + s * 6
+    rbase = env * n_dof_pad + node * 6
+    acc = float(0.0)
+    for c in range(6):
+        acc = acc + binv[row + c] * r[rbase + c]
+    z[tid] = acc
+
+
+_vec6 = wp.types.vector(length=6, dtype=wp.float32)
+
+
+@wp.kernel
+def _scale_preconditioner_blocks(
+    rows: wp.array[int],
+    values: wp.array[float],
+    inverse: wp.array[float],
+    scaled: wp.array[float],
+    n_nodes: int,
+    nnz: int,
+):
+    tid = wp.tid()
+    env = tid // nnz
+    local = tid % nnz
+    block = local // 36
+    row, col = (local % 36) // 6, local % 6
+    inv_base = (env * n_nodes + rows[block]) * 36 + row * 6
+    value = float(0.0)
+    for k in range(6):
+        value += inverse[inv_base + k] * values[env * nnz + block * 36 + k * 6 + col]
+    scaled[tid] = value
+
+
+@wp.kernel
+def _apply_colored_sweep(
+    offsets: wp.array[int],
+    columns: wp.array[int],
+    scaled: wp.array[float],
+    inverse: wp.array[float],
+    colors: wp.array[int],
+    nodes: wp.array[int],
+    residual: wp.array[float],
+    output: wp.array[float],
+    n_nodes: int,
+    nnz: int,
+    padded: int,
+    color: int,
+    forward: bool,
+):
+    # One thread per DOF. D^-1 A is shared by every PCG iteration, so the
+    # expensive node-block product is prepared once per linear system.
+    tid = wp.tid()
+    env = tid // (6 * nodes.shape[0])
+    node = nodes[(tid // 6) % nodes.shape[0]]
+    row = tid % 6
+    base = env * padded + node * 6
+    value = float(0.0)
+    if forward:
+        for col in range(6):
+            value += inverse[(env * n_nodes + node) * 36 + row * 6 + col] * residual[base + col]
+    else:
+        value = output[base + row]
+    for block in range(offsets[node], offsets[node + 1]):
+        other = columns[block]
+        active = colors[other] < color
+        if not forward:
+            active = colors[other] > color
+        if active:
+            for col in range(6):
+                value -= scaled[env * nnz + block * 36 + row * 6 + col] * output[env * padded + other * 6 + col]
+    output[base + row] = value
+
+
+# ---------------------------------------------------------------------------
+# Tile-based + fused PCG kernels
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def _pcg_load_rhs(
+    b: wp.array[float],
+    r: wp.array[float],
+    r_next: wp.array[float],
+    x: wp.array[float],
+    rz_prev: wp.array[wp.float64],
+    rz_cur: wp.array[wp.float64],
+    pAp: wp.array[wp.float64],
+    n_dof: int,
+    n_dof_pad: int,
+):
+    """Initialize a PCG solve, including padding and scalar accumulators."""
+    tid = wp.tid()
+    env, i = tid // n_dof_pad, tid % n_dof_pad
+    value = float(0.0)
+    if i < n_dof:
+        value = b[env * n_dof + i]
+    r[tid] = value
+    r_next[tid] = 0.0
+    x[tid] = 0.0
+    if i == 0:
+        rz_prev[env] = wp.float64(0.0)
+        rz_cur[env] = wp.float64(0.0)
+        pAp[env] = wp.float64(0.0)
+
+
+@wp.kernel
+def _pcg_store_x(x_pad: wp.array[float], x_ext: wp.array[float], n_dof: int, n_dof_pad: int):
+    """dim = N*n_dof. Copy x (padded internal) back to x_ext (unpadded external)."""
+    tid = wp.tid()
+    env = tid // n_dof
+    i = tid % n_dof
+    x_ext[tid] = x_pad[env * n_dof_pad + i]
+
+
+@wp.kernel
+def _dot_tile_batched(
+    a: wp.array[float],
+    b: wp.array[float],
+    out: wp.array[wp.float64],
+    zero_out: wp.array[wp.float64],
+    n_dof_pad: int,
+    n_chunks: int,
+):
+    """One block per (env, chunk). wp.launch_tiled(dim=[N*n_chunks], block_dim=TILE_PCG).
+
+    Replaces the single-block-per-env design (dim=[N]) that left N-1 of N SMs idle.
+    Each block processes TILE_PCG=128 elements and atomically accumulates into out[env].
+    Caller must zero out[] before launch.  zero_out[env] is set to 0 as a side effect
+    (identical writes from every block of the env) so the next accumulator in the PCG
+    iteration needs no separate memset node; it must not be read by this kernel's consumers.
+    """
+    tid = wp.tid()  # block index 0..N*n_chunks-1
+    env = tid // n_chunks
+    chunk = tid % n_chunks
+    off = env * n_dof_pad + chunk * TILE_PCG
+
+    zero_out[env] = wp.float64(0.0)
+
+    ta = wp.tile_load(a, shape=TILE_PCG, offset=off)
+    tb = wp.tile_load(b, shape=TILE_PCG, offset=off)
+    s = wp.tile_sum(ta * tb)
+    wp.tile_atomic_add(out, wp.tile_map(_to_double, s), offset=env)
+
+
+@wp.kernel
+def _pcg_mv_p_update_blk_batched(
+    blk_offsets: wp.array[wp.int32],
+    blk_columns: wp.array[wp.int32],
+    values: wp.array[float],
+    z: wp.array[float],
+    p_old: wp.array[float],
+    rz_prev: wp.array[wp.float64],  # r·z of the previous iteration (beta denominator)
+    rz_cur: wp.array[wp.float64],  # r·z of this iteration (beta numerator, alpha numerator)
+    rz_zero: wp.array[wp.float64],  # dead r·z buffer, zeroed here for the following xrz accumulation
+    p_new: wp.array[float],
+    Ap: wp.array[float],
+    pAp: wp.array[wp.float64],  # accumulator, zeroed by the previous xrz
+    n_dof: int,
+    nnz: int,
+    n_dof_pad: int,
+    n_chunks: int,
+):
+    """wp.launch(dim=(N*n_chunks, TILE_PCG), block_dim=TILE_PCG): one thread per row, one
+    block per (env, 128-row chunk).  Fused p-update, SpMV and p·Ap for one PCG iteration.
+
+    p_new = z + beta*p_old with beta = rz_cur/rz_prev (0 on the first iteration, rz_prev = 0);
+    Ap[i] = sum_j A_ij p_new[j] with p_new[j] recomputed per column so no grid sync is
+    needed.  p·Ap is tile-reduced over the block before a single atomic per block:
+    per-row atomics on the same address serialise.  Padded stride n_dof_pad per env;
+    padded rows contribute 0.
+
+    Blocked layout: row i belongs to node i//6; its 6x6 blocks sit at
+    ``values[env*nnz + b*36 + (i%6)*6 + t]`` for the node's block range b, columns
+    ``blk_columns[b]*6 + t``.  One column index serves 36 values (scalar CSR needs one per
+    value) and the six DOF rows of a node read the same index, so the loads coalesce.
+    """
+    block_id, lane = wp.tid()
+    env = block_id // n_chunks
+    chunk = block_id % n_chunks
+    i = chunk * TILE_PCG + lane
+    base_dof = env * n_dof_pad
+    base_nnz = env * nnz
+
+    rz_zero[env] = wp.float64(0.0)
+    rz_prev_val = rz_prev[env]
+    beta = float(rz_cur[env] / rz_prev_val) if wp.abs(rz_prev_val) > wp.float64(1.0e-30) else float(0.0)
+
+    contrib = float(0.0)
+    if i < n_dof:
+        acc = float(0.0)
+        node = i // 6
+        row_base = base_nnz + (i % 6) * 6
+        for b in range(blk_offsets[node], blk_offsets[node + 1]):
+            j = base_dof + blk_columns[b] * 6
+            v = row_base + b * 36
+            for c in range(6):
+                acc = acc + values[v + c] * (z[j + c] + beta * p_old[j + c])
+        p_i = z[base_dof + i] + beta * p_old[base_dof + i]
+        p_new[base_dof + i] = p_i
+        Ap[base_dof + i] = acc
+        contrib = p_i * acc
+
+    t = wp.tile(contrib)
+    s = wp.tile_sum(t)
+    wp.tile_atomic_add(pAp, wp.tile_map(_to_double, s), offset=env)
+
+
+@wp.kernel
+def _pcg_update_xrz_blk_batched(
+    rz_old: wp.array[wp.float64],
+    pAp: wp.array[wp.float64],
+    p: wp.array[float],
+    Ap: wp.array[float],
+    x: wp.array[float],
+    r_in: wp.array[float],  # residual of the previous iteration (read-only here)
+    r_out: wp.array[float],  # updated residual (ping-pong buffer)
+    binv: wp.array[float],  # (N*n_nodes*36,) block-Jacobi inverses
+    z: wp.array[float],
+    rz_new: wp.array[wp.float64],  # accumulator — zeroed by the preceding mv kernel
+    pAp_zero: wp.array[wp.float64],  # other pAp buffer, zeroed here for the next mv accumulation
+    n_dof: int,
+    n_dof_pad: int,
+    n_chunks: int,
+    compute_preconditioner: bool,
+):
+    """wp.launch(dim=(N*n_chunks, TILE_PCG), block_dim=TILE_PCG): one thread per row.
+
+    x += alpha p;  r_out = r_in - alpha Ap;  z = blockdiag(K)^-1 r_out;  rz_new += r_out . z.
+    The block product needs the six updated residual rows of the node, so every thread
+    recomputes them from r_in/Ap (read-only) instead of reading r_out written by its
+    neighbours — hence the r ping-pong. Padded rows (i >= n_dof) are left untouched (0).
+    """
+    block_id, lane = wp.tid()
+    env = block_id // n_chunks
+    chunk = block_id % n_chunks
+    i = chunk * TILE_PCG + lane
+    base_dof = env * n_dof_pad
+
+    pAp_zero[env] = wp.float64(0.0)
+    rz_old_val = rz_old[env]
+    pAp_val = pAp[env]
+    alpha = float(rz_old_val / pAp_val) if wp.abs(pAp_val) > wp.float64(1.0e-30) else float(0.0)
+
+    contrib = float(0.0)
+    if i < n_dof:
+        gi = base_dof + i
+        x[gi] = x[gi] + alpha * p[gi]
+        if compute_preconditioner:
+            node = i // 6
+            s = i % 6
+            nbase = base_dof + node * 6
+            brow = (env * (n_dof // 6) + node) * 36 + s * 6
+            z_i = float(0.0)
+            r_i = float(0.0)
+            for c in range(6):
+                r_c = r_in[nbase + c] - alpha * Ap[nbase + c]
+                z_i = z_i + binv[brow + c] * r_c
+                if c == s:
+                    r_i = r_c
+            r_out[gi] = r_i
+            z[gi] = z_i
+            contrib = r_i * z_i
+        else:
+            r_out[gi] = r_in[gi] - alpha * Ap[gi]
+
+    if compute_preconditioner:
+        t = wp.tile(contrib)
+        s_blk = wp.tile_sum(t)
+        wp.tile_atomic_add(rz_new, wp.tile_map(_to_double, s_blk), offset=env)
+
+
+class PcgSolverBatched:
+    """PCG for N independent ANCF systems sharing the same sparsity pattern.
+
+    All vector arguments to solve() are flat [N*n_dof].
+    K is stored as 6x6 node blocks: values flat [N*nnz] with nnz = nnzb*36, node-block CSR
+    ``blk_offsets`` / ``blk_columns`` shared across envs (see ``build_block_structure``).
+    """
+
+    def __init__(self, n_envs: int, n_dof: int, nnz: int, device: str, max_iters: int = 200):
+        self.n_envs = n_envs
+        self.n_dof = n_dof
+        self.nnz = nnz
+        self.device = device
+        self.max_iters = max_iters
+        N = n_envs
+        # Pad n_dof to next multiple of TILE_PCG (128) for tile kernels.
+        n_dof_pad = int(math.ceil(n_dof / 128) * 128)
+        self._n_dof_pad = n_dof_pad
+        # n_chunks: blocks per env in multi-block tile launches (N*n_chunks total blocks).
+        # Each block handles exactly TILE_PCG=128 DOFs → fills all SMs.
+        self._n_chunks = n_dof_pad // int(TILE_PCG)
+        if n_dof % 6 != 0:
+            raise ValueError(f"PcgSolverBatched: n_dof={n_dof} is not a multiple of 6 (ANCF node DOFs)")
+        self.n_nodes = n_dof // 6
+        # Residual ping-pongs between two buffers (the fused xrz kernel reads the six
+        # residual rows of a node while writing its own row).
+        self._r = [wp.zeros(N * n_dof_pad, dtype=float, device=device) for _ in range(2)]
+        self.z = wp.zeros(N * n_dof_pad, dtype=float, device=device)
+        # Search direction ping-pongs between two buffers (the fused mv kernel reads p_old
+        # for every column while writing its own row of p_new).
+        self._p = [wp.zeros(N * n_dof_pad, dtype=float, device=device) for _ in range(2)]
+        self.Ap = wp.zeros(N * n_dof_pad, dtype=float, device=device)
+        # 6x6 block-Jacobi preconditioner: inverse diagonal block per (env, node).
+        self.binv = wp.zeros(N * self.n_nodes * 36, dtype=float, device=device)
+        # r·z rotates over three buffers (prev, cur, next-accumulator); p·Ap over two.
+        self._rz = [wp.zeros(N, dtype=wp.float64, device=device) for _ in range(3)]
+        self._pAp = [wp.zeros(N, dtype=wp.float64, device=device) for _ in range(2)]
+        # Initial ||r||^2_M, kept so convergence can be reported after a solve.
+        self.rz_init = wp.zeros(N, dtype=wp.float64, device=device)
+        self.rz_last = self._rz[0]
+        self._x_pad = wp.zeros(N * n_dof_pad, dtype=float, device=device)
+        self._color_nodes = []
+        self._sweep_kernel = None
+        self._sweep_packed = None
+        self._local_kernel = None
+        self._sweep_block_dim = 0
+        self._sweep_nodes = None
+        self._sweep_counts = None
+        self._sweep_offsets = None
+        self._sweep_blocks = None
+        self._node_colors = None
+        self._block_rows = None
+        self._scaled_blocks = wp.zeros(N * nnz, dtype=float, device=device)
+        self.coarse_x = None
+        self.coarse_D = None
+        # Only Schur multiple-RHS callers may opt in: all members of each
+        # adjacent group must have identical geometry, masks and matrices.
+        self.coarse_repeats = 1
+        # Opt-in for identical adjacent matrices in the block-local PCG path.
+        # RHS, solution, residual and iteration reductions remain independent.
+        self.matrix_repeats = 1
+        self.coarse_free = wp.ones(N * n_dof, dtype=float, device=device)
+        self._coarse_q = wp.zeros(N * n_dof_pad * 9, dtype=float, device=device)
+        self._coarse_aq = wp.zeros(N * n_dof_pad * 9, dtype=float, device=device)
+        self._coarse_matrix = wp.zeros(N * 81, dtype=wp.float64, device=device)
+        self._coarse_factors = wp.zeros_like(self._coarse_matrix)
+        self._coarse_scales = wp.zeros(N * 9, dtype=wp.float64, device=device)
+        self._coarse_rhs = wp.zeros(N * 9, dtype=wp.float64, device=device)
+        self._coarse_coefficients = wp.zeros((N, 9), dtype=float, device=device)
+
+    def set_graph(self, offsets: np.ndarray, columns: np.ndarray) -> None:
+        """Color the block graph once for a symmetric Gauss–Seidel preconditioner."""
+        self._block_rows = wp.array(np.repeat(np.arange(self.n_nodes), np.diff(offsets)), dtype=int, device=self.device)
+        adjacency = [set(map(int, columns[offsets[i] : offsets[i + 1]])) - {i} for i in range(self.n_nodes)]
+        colors = np.full(self.n_nodes, -1, dtype=np.int32)
+        for node in sorted(range(self.n_nodes), key=lambda i: -len(adjacency[i])):
+            used = {int(colors[j]) for j in adjacency[node] if colors[j] >= 0}
+            color = 0
+            while color in used:
+                color += 1
+            colors[node] = color
+        self._node_colors = wp.array(colors, dtype=int, device=self.device)
+        self._color_nodes = [
+            wp.array(np.flatnonzero(colors == i), dtype=int, device=self.device) for i in range(int(colors.max()) + 1)
+        ]
+        # Small tires fit each color in one block and the complete sweep vector
+        # in shared memory. Larger meshes retain the distributed sweep.
+        counts = np.bincount(colors).astype(np.int32)
+        self._sweep_kernel = None
+        self._sweep_packed = None
+        self._local_kernel = None
+        if wp.get_device(self.device).is_cuda and self.n_nodes <= 256 and int(counts.max()) * 6 <= 512:
+            nodes = np.zeros((len(counts), int(counts.max())), dtype=np.int32)
+            for color, count in enumerate(counts):
+                nodes[color, :count] = np.flatnonzero(colors == color)
+            self._sweep_nodes = wp.array(nodes, dtype=int, device=self.device)
+            self._sweep_counts = wp.array(counts, dtype=int, device=self.device)
+            self._sweep_block_dim = max(32, 1 << (int(counts.max()) * 6 - 1).bit_length())
+            # Sparsity and coloring are fixed across Newton/coupling trials.
+            # Keep each triangle in the original CSR order to preserve summation.
+            sweep_blocks, sweep_offsets = [], []
+            for forward in (True, False):
+                starts = [len(sweep_blocks)]
+                for node in range(self.n_nodes):
+                    for block in range(offsets[node], offsets[node + 1]):
+                        other = columns[block]
+                        use_block = colors[other] < colors[node] if forward else colors[other] > colors[node]
+                        if use_block:
+                            sweep_blocks.append(block)
+                    starts.append(len(sweep_blocks))
+                sweep_offsets.append(starts)
+            self._sweep_offsets = wp.array(sweep_offsets, dtype=int, device=self.device)
+            self._sweep_blocks = wp.array(sweep_blocks, dtype=int, device=self.device)
+            layout = kernels_pcg.packed_sweep_layout(
+                np.asarray(sweep_offsets), np.asarray(sweep_blocks), columns, nodes, counts, self.nnz
+            )
+            if layout is None:
+                self._sweep_kernel = kernels_pcg.make_colored_sweep(self._n_dof_pad, len(counts))
+            else:
+                sources, neighbors, degrees, width, max_edges = layout
+                self._sweep_sources = wp.array(sources, dtype=int, device=self.device)
+                self._sweep_packed = wp.empty(self.n_envs * sources.size, dtype=float, device=self.device)
+                self._sweep_neighbors = wp.array(neighbors, dtype=int, device=self.device)
+                self._sweep_degrees = wp.array(degrees, dtype=int, device=self.device)
+                self._sweep_kernel = kernels_pcg.make_packed_colored_sweep(
+                    self._n_dof_pad, len(counts), width, max_edges
+                )
+
+                self._local_degree = int(np.diff(offsets).max())
+                sources = np.full((self._local_degree, 6, self._n_dof_pad), -1, dtype=np.int32)
+                neighbors = np.zeros((self._local_degree, self.n_nodes), dtype=np.int32)
+                for node in range(self.n_nodes):
+                    for edge, block in enumerate(range(offsets[node], offsets[node + 1])):
+                        neighbors[edge, node] = columns[block]
+                        for col in range(6):
+                            for row in range(6):
+                                sources[edge, col, node * 6 + row] = block * 36 + row * 6 + col
+                self._local_sources = wp.array(sources.reshape(-1), dtype=int, device=self.device)
+                self._local_columns = wp.array(neighbors, dtype=int, device=self.device)
+                self._local_values = wp.empty(sources.size * self.n_envs, dtype=float, device=self.device)
+                self._local_kernel = kernels_pcg.make_local_pcg(
+                    self._n_dof_pad, len(counts), width, max_edges, self._sweep_block_dim, self._local_degree
+                )
+
+    def _prepare_preconditioner(self, offsets, columns, values):
+        repeats = self.matrix_repeats
+        if repeats < 1 or self.n_envs % repeats:
+            raise ValueError("matrix_repeats must be a positive divisor of n_envs")
+        if repeats > 1 and self._local_kernel is None:
+            raise ValueError("Shared matrix preparation requires the block-local PCG path")
+        wp.launch(
+            _extract_blockdiag_inv_batched,
+            dim=self.n_envs // repeats * self.n_nodes,
+            block_dim=32,
+            inputs=[offsets, columns, values, self.binv, self.n_nodes, self.nnz, repeats],
+            device=self.device,
+        )
+        if self._sweep_packed is not None:
+            wp.launch(
+                kernels_pcg.pack_sweep_values,
+                dim=self._sweep_packed.size // repeats,
+                block_dim=128,
+                inputs=[
+                    values,
+                    self.binv,
+                    self._block_rows,
+                    self._sweep_sources,
+                    self.n_nodes,
+                    self.nnz,
+                    self._sweep_sources.size,
+                    self._sweep_packed,
+                    repeats,
+                ],
+                device=self.device,
+            )
+        elif self._block_rows is not None:
+            wp.launch(
+                _scale_preconditioner_blocks,
+                dim=self.n_envs * self.nnz,
+                inputs=[self._block_rows, values, self.binv, self._scaled_blocks, self.n_nodes, self.nnz],
+                device=self.device,
+            )
+
+    def _precondition(self, offsets, columns, values, residual, jacobi_ready: bool = False) -> None:
+        if not self._color_nodes:
+            wp.launch(
+                _apply_block_precond,
+                dim=self.n_envs * self._n_dof_pad,
+                inputs=[self.binv, residual, self.z, self.n_dof, self._n_dof_pad, self.matrix_repeats],
+                device=self.device,
+            )
+            return
+        if self._sweep_kernel is not None:
+            # The fused PCG update already computes D^-1 r; reuse that product.
+            if not jacobi_ready:
+                wp.launch(
+                    _apply_block_precond,
+                    dim=self.n_envs * self._n_dof_pad,
+                    inputs=[self.binv, residual, self.z, self.n_dof, self._n_dof_pad, self.matrix_repeats],
+                    device=self.device,
+                )
+            if self._sweep_packed is None:
+                inputs = [
+                    self._sweep_offsets,
+                    self._sweep_blocks,
+                    columns,
+                    self._scaled_blocks,
+                    self._sweep_nodes,
+                    self._sweep_counts,
+                    self.z,
+                    self.nnz,
+                ]
+            else:
+                inputs = [
+                    self._sweep_packed,
+                    self._sweep_neighbors,
+                    self._sweep_degrees,
+                    self._sweep_nodes,
+                    self._sweep_counts,
+                    self.z,
+                    self.matrix_repeats,
+                ]
+            wp.launch(
+                self._sweep_kernel,
+                dim=(self.n_envs, self._sweep_block_dim),
+                block_dim=self._sweep_block_dim,
+                inputs=inputs,
+                device=self.device,
+            )
+            return
+        # (D+U)^-1 D (D+L)^-1 is symmetric positive definite for SPD A.
+        # Reverse the ordering in the second sweep so PCG retains its symmetry.
+        for forward in (True, False):
+            order = range(len(self._color_nodes)) if forward else reversed(range(len(self._color_nodes)))
+            for color in order:
+                nodes = self._color_nodes[color]
+                wp.launch(
+                    _apply_colored_sweep,
+                    dim=self.n_envs * nodes.shape[0] * 6,
+                    inputs=[
+                        offsets,
+                        columns,
+                        self._scaled_blocks,
+                        self.binv,
+                        self._node_colors,
+                        nodes,
+                        residual,
+                        self.z,
+                        self.n_nodes,
+                        self.nnz,
+                        self._n_dof_pad,
+                        color,
+                        forward,
+                    ],
+                    device=self.device,
+                )
+
+    def _correct_coarse(self, residual: wp.array[float]) -> None:
+        self._coarse_rhs.zero_()
+        wp.launch_tiled(
+            kernels_coarse.project,
+            dim=[self.n_envs * 9 * self._n_chunks],
+            block_dim=128,
+            inputs=[self._coarse_q, residual, self._n_dof_pad, self._n_chunks, self._coarse_rhs],
+            device=self.device,
+        )
+        wp.launch(
+            kernels_coarse.solve_coarse_factored,
+            dim=self.n_envs,
+            inputs=[self._coarse_factors, self._coarse_scales, self._coarse_rhs, self._coarse_coefficients],
+            device=self.device,
+        )
+        wp.launch(
+            kernels_coarse.correct,
+            dim=self.n_envs * self.n_dof,
+            inputs=[
+                self._coarse_q,
+                self._coarse_aq,
+                self._coarse_coefficients,
+                self.n_dof,
+                self._n_dof_pad,
+                self._x_pad,
+                residual,
+            ],
+            device=self.device,
+        )
+
+    def _dot(self, a: wp.array[float], b: wp.array[float], out: wp.array[float], zero_out: wp.array[float]) -> None:
+        """Multi-block dot product. out[] must be zeroed by caller; zero_out[] is zeroed as a side effect."""
+        n_ch = self._n_chunks
+        wp.launch_tiled(
+            _dot_tile_batched,
+            dim=[self.n_envs * n_ch],
+            inputs=[a, b, out, zero_out, self._n_dof_pad, n_ch],
+            block_dim=int(TILE_PCG),
+            device=self.device,
+        )
+
+    def solve(
+        self,
+        K_offsets: wp.array[wp.int32],
+        K_columns: wp.array[wp.int32],
+        K_values: wp.array[float],
+        b: wp.array[float],
+        x: wp.array[float],
+        *,
+        compute_residual_report: bool = True,
+    ) -> None:
+        """Solve K x = b for all envs.  ``K_offsets`` / ``K_columns`` are the node-block CSR."""
+        dev, N, n, n_pad = self.device, self.n_envs, self.n_dof, self._n_dof_pad
+        n_ch, nnz = self._n_chunks, self.nnz
+
+        self._prepare_preconditioner(K_offsets, K_columns, K_values)
+
+        # Load RHS, zero solution, z = B⁻¹r, rz_0 = r·z.  p is formed inside the first
+        # mv kernel (beta = 0 because rz_prev starts at zero).
+        r_cur, r_next = self._r
+        rz_prev, rz_cur, rz_next = self._rz
+        wp.launch(
+            _pcg_load_rhs,
+            dim=N * n_pad,
+            inputs=[b, r_cur, r_next, self._x_pad, rz_prev, rz_cur, self._pAp[0], n, n_pad],
+            device=dev,
+        )
+        if self.coarse_x is not None:
+            repeats = self.coarse_repeats
+            if repeats < 1 or N % repeats:
+                raise ValueError("coarse_repeats must be a positive divisor of n_envs")
+            wp.launch(
+                kernels_coarse.build_modes,
+                dim=(9, N // repeats * n),
+                block_dim=32,
+                inputs=[
+                    self.coarse_x,
+                    self.coarse_D,
+                    self.coarse_free,
+                    K_offsets,
+                    K_columns,
+                    K_values,
+                    n,
+                    nnz,
+                    n_pad,
+                    self._coarse_q,
+                    self._coarse_aq,
+                    repeats,
+                ],
+                device=dev,
+            )
+            self._coarse_matrix.zero_()
+            wp.launch_tiled(
+                kernels_coarse.gram,
+                dim=[N // repeats * 81 * n_ch],
+                block_dim=128,
+                inputs=[self._coarse_q, self._coarse_aq, n_pad, n_ch, self._coarse_matrix, repeats],
+                device=dev,
+            )
+            wp.launch(
+                kernels_coarse.factor_coarse,
+                dim=(N // repeats, 128),
+                block_dim=128,
+                inputs=[self._coarse_matrix, self._coarse_factors, self._coarse_scales, repeats],
+                device=dev,
+            )
+            self._correct_coarse(r_cur)
+        self._precondition(K_offsets, K_columns, K_values, r_cur)
+        self._dot(r_cur, self.z, rz_cur, rz_next)
+        if compute_residual_report:
+            wp.copy(self.rz_init, rz_cur)
+
+        if self._local_kernel is not None:
+            wp.launch(
+                kernels_pcg.pack_matrix,
+                dim=(N // self.matrix_repeats, self._local_sources.size),
+                inputs=[K_values, self._local_sources, nnz, self._local_values, self.matrix_repeats],
+                device=dev,
+            )
+            wp.launch(
+                self._local_kernel,
+                dim=(N, self._sweep_block_dim),
+                block_dim=self._sweep_block_dim,
+                inputs=[
+                    self._local_columns,
+                    self._local_values,
+                    self.binv,
+                    self._sweep_packed,
+                    self._sweep_neighbors,
+                    self._sweep_degrees,
+                    self._sweep_nodes,
+                    self._sweep_counts,
+                    self._x_pad,
+                    r_cur,
+                    self.z,
+                    rz_cur,
+                    n,
+                    nnz,
+                    self.max_iters,
+                    compute_residual_report,
+                    self.matrix_repeats,
+                ],
+                device=dev,
+            )
+        else:
+            # Each kernel zeroes the dead scalar buffer for its successor.
+            # The previous reader has completed at the kernel boundary.
+            p_old, p_new = self._p
+            pAp_cur, pAp_other = self._pAp
+            for iteration in range(self.max_iters):
+                need_preconditioner = compute_residual_report or iteration + 1 < self.max_iters
+                wp.launch(
+                    _pcg_mv_p_update_blk_batched,
+                    dim=(N * n_ch, int(TILE_PCG)),
+                    block_dim=int(TILE_PCG),
+                    inputs=[
+                        K_offsets,
+                        K_columns,
+                        K_values,
+                        self.z,
+                        p_old,
+                        rz_prev,
+                        rz_cur,
+                        rz_next,
+                        p_new,
+                        self.Ap,
+                        pAp_cur,
+                        n,
+                        nnz,
+                        n_pad,
+                        n_ch,
+                    ],
+                    device=dev,
+                )
+                wp.launch(
+                    _pcg_update_xrz_blk_batched,
+                    dim=(N * n_ch, int(TILE_PCG)),
+                    block_dim=int(TILE_PCG),
+                    inputs=[
+                        rz_cur,
+                        pAp_cur,
+                        p_new,
+                        self.Ap,
+                        self._x_pad,
+                        r_cur,
+                        r_next,
+                        self.binv,
+                        self.z,
+                        rz_next,
+                        pAp_other,
+                        n,
+                        n_pad,
+                        n_ch,
+                        need_preconditioner,
+                    ],
+                    device=dev,
+                )
+                if self._color_nodes and need_preconditioner:
+                    self._precondition(K_offsets, K_columns, K_values, r_next, jacobi_ready=True)
+                    rz_next.zero_()
+                    self._dot(r_next, self.z, rz_next, rz_prev)
+                rz_prev, rz_cur, rz_next = rz_cur, rz_next, rz_prev
+                p_old, p_new = p_new, p_old
+                pAp_cur, pAp_other = pAp_other, pAp_cur
+                r_cur, r_next = r_next, r_cur
+        # The final preconditioned residual is diagnostic only. Omitting it
+        # leaves x/r and the final coarse correction unchanged.
+        self.rz_last = rz_cur if compute_residual_report else None
+
+        if self.coarse_x is not None:
+            self._correct_coarse(r_cur)
+        wp.launch(_pcg_store_x, dim=N * n, inputs=[self._x_pad, x, n, n_pad], device=dev)
+
+
+# ---------------------------------------------------------------------------
+# Progress spinner for long JIT compilations
+# ---------------------------------------------------------------------------
+
+
+class _CompileProgress:
+    """Context manager that shows an ASCII spinner + elapsed time on one line.
+
+    Prints nothing unless ``enabled`` (see :paramref:`SolverANCFTire.verbose`).
+
+    Usage::
+        with _CompileProgress("Building mass matrix", enabled=True):
+            wp.launch(kernel, ...)
+            wp.synchronize_device(dev)
+    """
+
+    _FRAMES = r"|/-\\"
+
+    def __init__(self, label: str, enabled: bool = False, interval: float = 0.15):
+        self._label = label
+        self._enabled = enabled
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self):
+        self._t0 = time.perf_counter()
+        if self._enabled:
+            self._thread.start()
+        return self
+
+    def __exit__(self, *_):
+        if not self._enabled:
+            return
+        self._stop.set()
+        self._thread.join()
+        elapsed = time.perf_counter() - self._t0
+        sys.stdout.write(f"\r  [done]  {self._label}  ({elapsed:.1f}s)\n")
+        sys.stdout.flush()
+
+    def _run(self):
+        i = 0
+        while not self._stop.is_set():
+            elapsed = time.perf_counter() - self._t0
+            frame = self._FRAMES[i % len(self._FRAMES)]
+            sys.stdout.write(f"\r  [{frame}]  {self._label}  {elapsed:.0f}s elapsed ...")
+            sys.stdout.flush()
+            time.sleep(self._interval)
+            i += 1
+
+
+# ---------------------------------------------------------------------------
+# State integration kernels
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def _build_dirichlet_dof_mask(dirichlet_idx: wp.array[wp.int32], dof_mask: wp.array[float]):
+    """dim = n_dirichlet.  Zero the 6 DOF-mask entries of each pinned node (mask pre-filled with 1)."""
+    i = wp.tid()
+    base = dirichlet_idx[i] * 6
+    for k in range(6):
+        dof_mask[base + k] = float(0.0)
+
+
+@wp.kernel
+def _build_dirichlet_nnz_mask_blk(
+    dof_mask: wp.array[float],  # (N*n_dof,)
+    blk_offsets: wp.array[wp.int32],  # (n_nodes+1,) shared node-block CSR
+    blk_columns: wp.array[wp.int32],  # (nnzb,)
+    n_dof: int,
+    nnz: int,  # per-env stride of bsr_values_batched (= nnzb*36)
+    nnz_mask: wp.array[float],  # (N*nnz,)
+):
+    """dim = N*n_dof.  +1 keep, 0 pinned row or column, -1 pinned diagonal (blocked layout)."""
+    tid = wp.tid()
+    env = tid // n_dof
+    r = tid % n_dof
+    node = r // 6
+    s = r % 6
+    dof_base = env * n_dof
+    row_base = env * nnz + s * 6
+    mr = dof_mask[dof_base + r]
+    for b in range(blk_offsets[node], blk_offsets[node + 1]):
+        c0 = blk_columns[b] * 6
+        for t in range(6):
+            c = c0 + t
+            v = mr * dof_mask[dof_base + c]
+            if r == c and mr == 0.0:
+                v = float(-1.0)
+            nnz_mask[row_base + b * 36 + t] = v
+
+
+@wp.kernel
+def mask_dof(mask: wp.array[float], arr: wp.array[float]):
+    """arr[i] *= mask[i] — zero the Dirichlet rows of a DOF vector."""
+    i = wp.tid()
+    arr[i] = arr[i] * mask[i]
+
+
+@wp.kernel
+def apply_dirichlet_to_bsr(mask_nnz: wp.array[float], values: wp.array[float]):
+    """Eliminate Dirichlet rows/columns from K_eff in place.
+
+    mask_nnz: +1 keep, 0 zero (row or column pinned), -1 pinned diagonal → 1.
+    With the matching residual rows zeroed the pinned DOFs decouple exactly and
+    the linear solve returns 0 for them; the free DOFs no longer receive the
+    constraint reaction through the off-diagonals.
+    """
+    i = wp.tid()
+    m = mask_nnz[i]
+    v = values[i]
+    if m < 0.0:
+        v = float(1.0)
+    elif m == 0.0:
+        v = float(0.0)
+    values[i] = v
+
+
+@wp.kernel
+def _assemble_rhs_gravity(
+    mass_flat: wp.array[float],  # lumped mass per DOF (n_nodes*6,)
+    gravity: wp.vec3,
+    rhs: wp.array[float],  # output: add gravity to rhs
+):
+    """Add M_lump * g to the right-hand-side force vector."""
+    i = wp.tid()
+    # gravity acts only on position DOFs (sub 0=x, 1=y, 2=z)
+    sub = i % 6
+    if sub == 0:
+        rhs[i] = rhs[i] + mass_flat[i] * gravity[0]
+    elif sub == 1:
+        rhs[i] = rhs[i] + mass_flat[i] * gravity[1]
+    elif sub == 2:
+        rhs[i] = rhs[i] + mass_flat[i] * gravity[2]
+
+
+@wp.kernel
+def _add_node_f_ext_persistent(
+    f_pers: wp.array[wp.vec3],  # per-node persistent forces [N * n_nodes]
+    global_f_ext: wp.array[float],  # (N * n_nodes * 6,) flat DOF vector
+):
+    """Add persistent per-node forces to global_f_ext after per-NR zero_().
+
+    Allows external contact forces computed once per substep (from committed
+    positions) to survive the per-NR-iteration global_f_ext.zero_() — identical
+    to how FEM eval_particle_ground_contacts writes to the constant RHS before
+    the CG solve.  One thread per node.
+    """
+    i = wp.tid()
+    base = i * 6
+    f = f_pers[i]
+    wp.atomic_add(global_f_ext, base + 0, f[0])
+    wp.atomic_add(global_f_ext, base + 1, f[1])
+    wp.atomic_add(global_f_ext, base + 2, f[2])
+
+
+@wp.kernel
+def _zero_nr_slot(out: wp.array[float], nr_slot: int, nr_max: int):
+    """Zero one NR history slot per env (diagnostics only)."""
+    e = wp.tid()
+    out[e * nr_max + nr_slot] = 0.0
+
+
+@wp.kernel
+def _accum_nr_residual_sq(
+    residual: wp.array[float],
+    out: wp.array[float],
+    nr_slot: int,
+    nr_max: int,
+    n_dof: int,
+):
+    """Accumulate ||R||^2 per env into an NR history slot (diagnostics only).
+
+    Writes only to ``out``; the solve is untouched.
+    """
+    i = wp.tid()
+    e = i // n_dof
+    wp.atomic_add(out, e * nr_max + nr_slot, residual[i] * residual[i])
+
+
+@wp.kernel
+def flatten_vec3_pair(
+    xdd: wp.array[wp.vec3],
+    Ddd: wp.array[wp.vec3],
+    flat: wp.array[float],  # (n_nodes*6,)
+):
+    """Pack (xdd, Ddd) into a flat DOF vector."""
+    i = wp.tid()
+    base = i * 6
+    flat[base] = xdd[i][0]
+    flat[base + 1] = xdd[i][1]
+    flat[base + 2] = xdd[i][2]
+    flat[base + 3] = Ddd[i][0]
+    flat[base + 4] = Ddd[i][1]
+    flat[base + 5] = Ddd[i][2]
+
+
+@wp.kernel
+def _zero_eas_alpha(eas_alpha: wp.array2d[float]):
+    """Reset all 5 EAS modes to zero for one element.
+
+    Called once per timestep, before the NR loop.  Prevents cross-timestep
+    accumulation of float-32 roundoff: for a rigid-body translation J_lifted ≠
+    J_ref at the ~1e-6 level (1.3 m vs 0.3 m positions), so HE ≠ 0 exactly and
+    α drifts by ~3e-6 per NR call.  Over 100 NR calls (2 frames × 10 substeps
+    × 5 NR) α reaches ~3e-4, creating asymmetric forces that violate the
+    discrete rotational symmetry and eventually cause NaN.
+
+    Within-timestep warm-start (across the 5 NR iterations) is preserved.
+    """
+    e = wp.tid()
+    eas_alpha[e, 0] = float(0.0)
+    eas_alpha[e, 1] = float(0.0)
+    eas_alpha[e, 2] = float(0.0)
+    eas_alpha[e, 3] = float(0.0)
+    eas_alpha[e, 4] = float(0.0)
+
+
+@wp.kernel
+def negate(src: wp.array[float], dst: wp.array[float]):
+    i = wp.tid()
+    dst[i] = -src[i]
+
+
+@wp.kernel
+def pointwise_scale(src: wp.array[float], s: float, dst: wp.array[float]):
+    i = wp.tid()
+    dst[i] = src[i] * s
+
+
+@wp.kernel
+def pointwise_mul(
+    a: wp.array[float],
+    b: wp.array[float],
+    out: wp.array[float],
+):
+    i = wp.tid()
+    out[i] = a[i] * b[i]
+
+
+def _model_gravity(model: Model) -> wp.vec3:
+    """Read gravity vector from Newton Model (returns (0,-9.81,0) if not set)."""
+    if model.gravity is not None:
+        g_np = model.gravity.numpy()
+        if g_np.shape[0] > 0:
+            return wp.vec3(float(g_np[0, 0]), float(g_np[0, 1]), float(g_np[0, 2]))
+    return wp.vec3(0.0, -9.81, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# SolverANCFTire
+# ---------------------------------------------------------------------------
+
+
+class SolverANCFTire(SolverBase):
+    """Implicit HHT-alpha integrator for ANCF3423 shell elements.
+
+    Both the Newton-Raphson and the PCG loop run a fixed iteration count (no
+    tolerance test) so one step is graph-capturable.
+
+    Args:
+        model: Newton :class:`~newton.Model` (used for device and gravity).
+        ancf_model: :class:`ANCFShellModel` holding the mesh and material data.
+        ground_z: Height of the rigid ground plane [m].
+        kn: Normal contact stiffness [N/m].
+        kd: Normal contact damping [N·s/m].
+        mu: Coulomb friction coefficient.
+        v_reg: Friction regularisation velocity [m/s].
+        nr_max_iter: Newton-Raphson iterations per step.
+        pcg_max_iter: PCG iterations per Newton-Raphson iteration.
+        n_envs: Number of independent tires solved as one batch (flat ``[n_envs * per_env]`` arrays).
+        thickness_gp: Through-thickness Gauss points, 3 or 5.
+        verbose: Print a progress spinner to stdout during kernel compilation
+            and graph capture.
+    """
+
+    hht_alpha: float = HHT_ALPHA
+    """HHT-alpha numerical dissipation parameter (-0.2); the public source for code deriving gains from it."""
+    hht_beta: float = HHT_BETA
+    """Newmark beta ``(1 - alpha)^2 / 4`` (0.36): contact gains use ``kn = m / (beta dt^2)``."""
+    hht_gamma: float = HHT_GAMMA
+    """Newmark gamma ``(1 - 2 alpha) / 2`` (0.70): the velocity tangent factor is ``gamma / (beta dt)``."""
+
+    def __init__(
+        self,
+        model: Model,
+        ancf_model: ANCFShellModel,
+        ground_z: float = 0.0,
+        kn: float = 2.0e6,
+        kd: float = 13.0,
+        mu: float = 0.9,
+        v_reg: float = 1.0e-3,
+        nr_max_iter: int = 3,
+        pcg_max_iter: int = 200,
+        n_envs: int = 1,
+        thickness_gp: int = 3,
+        verbose: bool = False,
+    ):
+        super().__init__(model)
+        self.ancf = ancf_model
+        self.n_envs = n_envs
+        self.verbose = bool(verbose)
+
+        self.ground_z = ground_z
+        # Optional heightfield / soil terrain (terrain_scm.TerrainSCM); set before capture_graph().
+        self.terrain = None
+        # Optional rigid-shape contact hook (rigid_contact.ANCFRigidShapeContact); same duck-typed
+        # ``apply_contact`` as the terrain, set before capture_graph().
+        self.rigid_contact = None
+        self.kn = kn
+        # Diagnostics: when True (set BEFORE capture_graph) each NR iteration
+        # records ||R||^2 into _nr_res_hist.  Purely additive - no solve change.
+        self.debug_residuals = False
+        self.kd = kd
+        self.mu = mu
+        self.v_reg = v_reg
+        self.nr_max_iter = nr_max_iter
+        if thickness_gp not in (3, 5):
+            raise ValueError(f"thickness_gp must be 3 or 5, got {thickness_gp}")
+        self.thickness_gp = int(thickness_gp)
+
+        n = ancf_model.n_nodes
+        ne = ancf_model.n_elems
+        n_dof = n * 6
+        N = n_envs
+        dev = self.device
+
+        # ---- ANCF state arrays (flat [N*n_nodes] when N>1) ----
+        x0_np = ancf_model.node_x0.numpy()  # (n_nodes, 3)
+        D0_np = ancf_model.node_D0.numpy()
+        if N > 1:
+            x0_tiled = np.tile(x0_np, (N, 1))  # (N*n_nodes, 3)
+            D0_tiled = np.tile(D0_np, (N, 1))
+            self.node_x = wp.array(x0_tiled, dtype=wp.vec3, device=dev)
+            self.node_D = wp.array(D0_tiled, dtype=wp.vec3, device=dev)
+        else:
+            self.node_x = wp.clone(ancf_model.node_x0)
+            self.node_D = wp.clone(ancf_model.node_D0)
+        self.node_xd = wp.zeros(N * n, dtype=wp.vec3, device=dev)
+        self.node_Dd = wp.zeros(N * n, dtype=wp.vec3, device=dev)
+        self.node_xdd = wp.zeros(N * n, dtype=wp.vec3, device=dev)
+        self.node_Ddd = wp.zeros(N * n, dtype=wp.vec3, device=dev)
+
+        # ---- Element-level scratch (flat [N*n_elems, ...]) ----
+        self.elem_f = wp.zeros((N * ne, 24), dtype=float, device=dev)
+        self.elem_K = wp.zeros((N * ne, 24, 24), dtype=float, device=dev)
+        # Follower-pressure force scratch (residual only; no pressure tangent).
+        self.elem_fp = wp.zeros((N * ne, 24), dtype=float, device=dev)
+        # Per-element surface orientation sign (+1 if winding normal points along
+        # the reference outward director, else −1) so positive pressure inflates.
+        x0_ref = ancf_model.node_x0.numpy()  # (n_nodes, 3)
+        D0_ref = ancf_model.node_D0.numpy()
+        en_ref = ancf_model.elem_nodes.numpy()  # (n_elems, 4)
+        Xc = x0_ref[en_ref]  # (n_elems, 4, 3)
+        n_ref = np.cross(Xc[:, 2] - Xc[:, 0], Xc[:, 3] - Xc[:, 1])
+        D_avg = D0_ref[en_ref].mean(axis=1)  # (n_elems, 3)
+        sgn = np.where(np.einsum("ij,ij->i", n_ref, D_avg) >= 0.0, 1.0, -1.0)
+        self.elem_psign = wp.array(sgn.astype(np.float32), dtype=float, device=dev)
+
+        # ---- Sealed-gas cavity (CTIS) state ----
+        # Reference enclosed volume V_ref (same formula as the device kernel,
+        # computed once on the host from the reference geometry). Shared across
+        # envs (reference topology is identical).
+        c0 = x0_ref.mean(axis=0)  # reference centroid
+        xbar0 = Xc.mean(axis=1)  # (n_elems, 3)
+        nrm0 = 0.5 * sgn[:, None] * n_ref  # outward area-normals
+        V_ref = float((1.0 / 3.0) * np.einsum("ij,ij->i", xbar0 - c0, nrm0).sum())
+        self._V_ref = max(V_ref, 1.0e-6)
+        self._inv_n_nodes = 1.0 / float(n)
+        self.cav_centroid_sum = wp.zeros(N * 3, dtype=float, device=dev)
+        self.cav_V = wp.zeros(N, dtype=float, device=dev)  # enclosed volume
+        # Fixed-order partial sums retain reproducibility without serializing an entire tire.
+        chunk = int(kernels_gather.CAVITY_CHUNK)
+        self._cav_centroid_parts = wp.zeros((N, (n + chunk - 1) // chunk), dtype=wp.vec3d, device=dev)
+        self._cav_volume_parts = wp.zeros((N, (ne + chunk - 1) // chunk), dtype=wp.float64, device=dev)
+        self._cav_centre = wp.zeros(N, dtype=wp.vec3, device=dev)
+        # Single-block cavity reduction and stiffness block size, selected by
+        # set_coupled_launch_config(); None / 256 keep the chunked default path.
+        self._cavity_reduction = None
+        self._cavity_block_dim = 0
+        self._stiffness_block_dim = 256
+        self._force_block_dim = 256
+        self.cav_p = wp.zeros(N, dtype=float, device=dev)  # absolute pressure
+        self.cav_Kgas = wp.zeros(N, dtype=float, device=dev)  # m·R·T (CTIS control)
+        self.cav_pbuild = wp.zeros(N, dtype=float, device=dev)  # build pressure
+        self.cav_circuit = False  # True: one air line joins every env's cavity (set_cavity_circuit)
+        # Per-GP B-row scratch: one slot per (element, Gauss point) so the
+        # GP-parallel kernel can store and read without races.
+        n_gp_total = 4 * self.thickness_gp
+        self.n_gp_total = n_gp_total
+        # Per-element B rows with the Gauss point innermost (see compute_element_forces_stiffness_batched_gp).
+        self.gp_bd = wp.zeros((N * ne, 72, n_gp_total), dtype=float, device=dev)
+        self.gp_bs0 = wp.zeros((N * ne, 24, n_gp_total), dtype=float, device=dev)
+        self.gp_b13 = wp.zeros((N * ne, 24, n_gp_total), dtype=float, device=dev)
+        self.gp_b23 = wp.zeros((N * ne, 24, n_gp_total), dtype=float, device=dev)
+        self.gp_force = wp.zeros((N * ne, 24, n_gp_total), dtype=float, device=dev)
+        # Per-element scratch of the single-env kernel compute_element_forces_stiffness
+        # (init sparsity build and the N=1 step), which keeps the element-major layout.
+        self.gp_bd_single = wp.zeros((ne, 24, 3), dtype=float, device=dev)
+        self.gp_bs0_single = wp.zeros((ne, 24), dtype=float, device=dev)
+        self.gp_b13_single = wp.zeros((ne, 24), dtype=float, device=dev)
+        self.gp_b23_single = wp.zeros((ne, 24), dtype=float, device=dev)
+        self.gp_w = wp.zeros((N * ne * n_gp_total,), dtype=float, device=dev)
+        # EAS alpha tiled [N*n_elems, 5] (frozen at 0 in the batched path; live in the N = 1 kernel)
+        eas_np = ancf_model.elem_eas_alpha.numpy()  # (n_elems, 5)
+        if N > 1:
+            ancf_model.elem_eas_alpha = wp.array(np.tile(eas_np, (N, 1)), dtype=float, device=dev)
+
+        # elem_mat tiled [N*n_elems, 11].
+        # If the caller pre-built a per-env mat array (shape [N*n_elems, 11])
+        # it is used as-is; otherwise the single-env mat is tiled uniformly.
+        mat_np = ancf_model.elem_mat.numpy()  # (n_elems, 11) or (N*n_elems, 11)
+        if N > 1 and mat_np.shape[0] == ne:
+            ancf_model.elem_mat = wp.array(np.tile(mat_np, (N, 1)), dtype=float, device=dev)
+        # Stiffness-proportional Rayleigh damping coefficient, read from the first
+        # element (uniform over the mesh).  Adds the damping Jacobian
+        # (1+α)·α_d·K·γ/(β·dt) to K_eff in _step_single/_step_batched.
+        self._alpha_damp = float(mat_np[0, 10])
+
+        # ---- Global DOF vectors (flat [N*n_dof]) ----
+        self.global_f_int = wp.zeros(N * n_dof, dtype=float, device=dev)
+        self.global_f_int0 = wp.zeros(N * n_dof, dtype=float, device=dev)
+        self.global_f_ext = wp.zeros(N * n_dof, dtype=float, device=dev)
+        self.global_f_ext0 = wp.zeros(N * n_dof, dtype=float, device=dev)
+        self.residual = wp.zeros(N * n_dof, dtype=float, device=dev)
+        self._nr_res_hist = wp.zeros(N * nr_max_iter, dtype=float, device=dev)
+        self.M_a = wp.zeros(N * n_dof, dtype=float, device=dev)
+        self.da = wp.zeros(N * n_dof, dtype=float, device=dev)
+        self.a_flat = wp.zeros(N * n_dof, dtype=float, device=dev)
+        self.neg_R = wp.zeros(N * n_dof, dtype=float, device=dev)
+        self.K_contact_diag = wp.zeros(N * n_dof, dtype=float, device=dev)
+        # Per-node translational 3x3 tangent of the rigid-shape hook (rigid_contact: a diagonal cannot
+        # hold a tilted contact), added onto the diagonal 6x6 BSR blocks next to K_contact_diag.
+        self.K_contact_blk = wp.zeros(N * n_dof // 6, dtype=wp.mat33, device=dev)
+
+        # ---- Live gauge pressure (p − p_build), per-env [Pa] ----
+        # Written each NR iteration by the cavity gas-law kernel from the current
+        # enclosed volume, then read by the follower-pressure force kernel.
+        # 0 = built shape held by elastics; >0 over-inflates; <0 deflates.
+        self.pressure = wp.zeros(N, dtype=float, device=dev)
+
+        # ---- Gravity (constant, read once) ----
+        self._gravity = _model_gravity(model)
+
+        # ---- Predictor scratch (flat [N*n_nodes]) ----
+        self.x_pred = wp.zeros(N * n, dtype=wp.vec3, device=dev)
+        self.D_pred = wp.zeros(N * n, dtype=wp.vec3, device=dev)
+        self.xd_pred = wp.zeros(N * n, dtype=wp.vec3, device=dev)
+        self.Dd_pred = wp.zeros(N * n, dtype=wp.vec3, device=dev)
+
+        # ---- Persistent per-node external forces (survive per-NR global_f_ext.zero_()) ----
+        # Caller zeros this buffer each substep, then writes contact/external forces once
+        # from committed positions.  The NR loop adds it back each iteration via
+        # _add_node_f_ext_persistent, keeping the load constant during the solve.
+        self.node_f_ext_persistent = wp.zeros(N * n, dtype=wp.vec3, device=dev)
+
+        # ---- Lumped mass ----
+        # Single-env mass computed once; replicated N times for flat ops.
+        self.lumped_mass = wp.zeros(n_dof, dtype=float, device=dev)
+        self.lumped_mass_scaled = wp.zeros(n_dof, dtype=float, device=dev)
+        self._precompute_mass()
+
+        # ---- Rest-configuration Jacobian inverses + EAS T0 basis (per element,
+        # constant for the solver's lifetime — see compute_rest_jacobians) ----
+        ne = self.ancf.n_elems
+        self.elem_det_J0c = wp.zeros(ne, dtype=float, device=dev)
+        self.elem_T0c0_d = wp.zeros(ne, dtype=wp.vec3, device=dev)
+        self.elem_T0c0_s = wp.zeros(ne, dtype=wp.vec3, device=dev)
+        self.elem_T0c1_d = wp.zeros(ne, dtype=wp.vec3, device=dev)
+        self.elem_T0c1_s = wp.zeros(ne, dtype=wp.vec3, device=dev)
+        self.elem_T0c2_d = wp.zeros(ne, dtype=wp.vec3, device=dev)
+        self.elem_T0c2_s = wp.zeros(ne, dtype=wp.vec3, device=dev)
+        self.elem_T0c3_d = wp.zeros(ne, dtype=wp.vec3, device=dev)
+        self.elem_T0c3_s = wp.zeros(ne, dtype=wp.vec3, device=dev)
+        self.elem_J0inv_a = wp.zeros(ne, dtype=wp.mat33, device=dev)
+        self.elem_J0inv_b = wp.zeros(ne, dtype=wp.mat33, device=dev)
+        self.elem_J0inv_cc = wp.zeros(ne, dtype=wp.mat33, device=dev)
+        self.elem_J0inv_d = wp.zeros(ne, dtype=wp.mat33, device=dev)
+        self.elem_J0inv_tA = wp.zeros(ne, dtype=wp.mat33, device=dev)
+        self.elem_J0inv_tB = wp.zeros(ne, dtype=wp.mat33, device=dev)
+        self.elem_J0inv_tC = wp.zeros(ne, dtype=wp.mat33, device=dev)
+        self.elem_J0inv_tD = wp.zeros(ne, dtype=wp.mat33, device=dev)
+        self._precompute_rest_jacobians()
+        # Tiled versions used by batched DOF-level kernels
+        if N > 1:
+            mass_np = self.lumped_mass.numpy()
+            self.lumped_mass_tiled = wp.array(np.tile(mass_np, N), dtype=float, device=dev)
+            self.lumped_mass_scaled_tiled = wp.zeros(N * n_dof, dtype=float, device=dev)
+        else:
+            self.lumped_mass_tiled = self.lumped_mass
+            self.lumped_mass_scaled_tiled = self.lumped_mass_scaled
+
+        # ---- Build K_eff sparsity: node-block CSR + element->block scatter map ----
+        self._init_keff_structure()
+
+        # ---- Blocked K_eff values: N independent [nnzb*36] blocks, shared node-block CSR ----
+        # Exact non-zero count (every element node pair is a full 6x6 block), so there is no
+        # triplet-capacity padding to zero or mask; refilled in place every NR iteration by
+        # _update_K_eff_inplace_batched before the PCG reads it.
+        self._nnz = self._nnzb * 36
+        self.bsr_values_batched = wp.zeros(N * self._nnz, dtype=float, device=dev)
+
+        # ---- Linear solver (batched Jacobi-PCG; works for N=1 too) ----
+        self.pcg = PcgSolverBatched(N, n_dof, self._nnz, dev, max_iters=pcg_max_iter)
+        self.pcg.coarse_x = self.node_x
+        self.pcg.coarse_D = self.node_D
+        self.pcg.set_graph(self.blk_offsets.numpy(), self.blk_columns.numpy())
+
+        # ---- Dirichlet nodes (optional bead coupling) ----
+        self._dirichlet_idx: wp.array[wp.int32] | None = None
+        self._dirichlet_dof_mask: wp.array[float] | None = None
+        self._dirichlet_nnz_mask: wp.array[float] | None = None
+
+        # ---- CUDA graph (populated by capture_graph()) ----
+        self._graph: wp.Graph | None = None
+
+    # ------------------------------------------------------------------
+    @property
+    def cavity_volume_ref(self) -> float:
+        """Reference enclosed cavity volume [m³] at the built shape (per env)."""
+        return self._V_ref
+
+    def _as_env_array(self, values) -> np.ndarray:
+        if np.isscalar(values):
+            return np.full(self.n_envs, float(values), dtype=np.float32)
+        arr = np.asarray(values, dtype=np.float32)
+        if arr.shape[0] != self.n_envs:
+            raise ValueError(f"expected {self.n_envs} values, got {arr.shape[0]}")
+        return arr
+
+    def set_cavity(self, nominal_pressure, build_pressure) -> None:
+        """Set the sealed-gas cavity state per environment [Pa].
+
+        The CTIS control is the air amount; we parameterise it by the nominal
+        pressure (the pressure the cavity would hold at the reference volume):
+        ``K_gas = m·R·T = nominal_pressure · V_ref``.  The live pressure then
+        self-regulates as ``p = K_gas / V(x)`` and the shell sees the gauge load
+        ``p − build_pressure``.  Updates device arrays in place (graph-safe) —
+        call between steps, not inside the substep loop.
+
+        Args:
+            nominal_pressure: target/nominal absolute pressure (scalar or per-env).
+            build_pressure: pressure the rest shape was built at (scalar or per-env).
+        """
+        self.cav_Kgas.assign(self._as_env_array(nominal_pressure) * self._V_ref)
+        self.cav_pbuild.assign(self._as_env_array(build_pressure))
+
+    def set_cavity_circuit(self, circuit: bool) -> None:
+        """Join every environment's cavity into one air circuit (``p = Σ K_gas / Σ V``) or
+        keep them sealed per tire. Selects the gas-law kernel, so call before
+        :meth:`capture_graph`; the CTIS amounts still come from :meth:`set_cavity`."""
+        self.cav_circuit = bool(circuit)
+
+    def set_coupled_launch_config(
+        self, stiffness_block_dim: int = 32, cavity_block_dim: int = 128, force_block_dim: int = 32
+    ) -> None:
+        """Select launch shapes for the coupled Newton substep.
+
+        :class:`CoupledShellNewton` re-evaluates the tangent and cavity volume
+        inside every interface iteration, so the cavity volume is reduced in one
+        block per tire and the element tangent uses a smaller block. Call before
+        :meth:`capture_graph`.
+
+        Args:
+            stiffness_block_dim: CUDA block size for the element tangent assembly.
+            cavity_block_dim: CUDA block size of the single-block cavity reduction.
+            force_block_dim: CUDA block size for the element force evaluation.
+        """
+        self._cavity_reduction = kernels_gather.make_cavity_reduction(
+            self.ancf.n_nodes, self.ancf.n_elems, int(cavity_block_dim)
+        )
+        self._cavity_block_dim = int(cavity_block_dim)
+        self._stiffness_block_dim = int(stiffness_block_dim)
+        self._force_block_dim = int(force_block_dim)
+
+    def _update_cavity_volume(self) -> None:
+        if self._cavity_reduction is not None:
+            wp.launch(
+                self._cavity_reduction,
+                dim=(self.n_envs, self._cavity_block_dim),
+                block_dim=self._cavity_block_dim,
+                inputs=[self.node_x, self.ancf.elem_nodes, self.elem_psign, self._cav_centre, self.cav_V],
+                device=self.device,
+            )
+            return
+        n, ne, dev = self.ancf.n_nodes, self.ancf.n_elems, self.device
+        wp.launch(
+            kernels_gather.cavity_centroid_parts,
+            dim=self._cav_centroid_parts.shape,
+            inputs=[self.node_x, n, self._cav_centroid_parts],
+            device=dev,
+        )
+        wp.launch(
+            kernels_gather.cavity_centroid_finish,
+            dim=self.n_envs,
+            inputs=[self._cav_centroid_parts, n, self._cav_centre],
+            device=dev,
+        )
+        wp.launch(
+            kernels_gather.cavity_volume_parts,
+            dim=self._cav_volume_parts.shape,
+            inputs=[
+                self.node_x,
+                self.ancf.elem_nodes,
+                self.elem_psign,
+                self._cav_centre,
+                n,
+                ne,
+                self._cav_volume_parts,
+            ],
+            device=dev,
+        )
+        wp.launch(
+            kernels_gather.cavity_volume_finish,
+            dim=self.n_envs,
+            inputs=[self._cav_volume_parts, self.cav_V],
+            device=dev,
+        )
+
+    def _launch_cavity_gas_law(self, dev) -> None:
+        if self.cav_circuit and self.n_envs > 1:
+            wp.launch(
+                cavity_gas_law_circuit,
+                dim=1,
+                inputs=[self.cav_Kgas, self.cav_V, self.cav_pbuild, self.cav_p, self.pressure, self.n_envs],
+                device=dev,
+            )
+        else:
+            wp.launch(
+                cavity_gas_law,
+                dim=self.n_envs,
+                inputs=[self.cav_Kgas, self.cav_V, self.cav_pbuild, self.cav_p, self.pressure],
+                device=dev,
+            )
+
+    # ------------------------------------------------------------------
+    def set_dirichlet_nodes(self, idx: np.ndarray | None) -> None:
+        """Pin nodes (Dirichlet boundary condition) for the NR solve.
+
+        Each NR iteration the pinned rows are removed from the linear system
+        (residual rows zeroed, K_eff rows/columns zeroed with a unit diagonal),
+        the predictor is overridden with the prescribed ``node_x/xd/D/Dd`` so
+        the pinned nodes hold exactly that state during the solve, and their
+        prescribed accelerations are retained. Populate the prescribed state *before*
+        calling :meth:`step`.
+
+        Args:
+            idx: global flat node indices to pin (already offset by
+                ``env * n_nodes`` for multi-env builds), or ``None`` to clear.
+        """
+        if idx is None:
+            self._dirichlet_idx = None
+            self._dirichlet_dof_mask = None
+            self._dirichlet_nnz_mask = None
+            self.pcg.coarse_free.fill_(1.0)
+            return
+        dev = self.device
+        self._dirichlet_idx = wp.array(np.asarray(idx, dtype=np.int32), dtype=wp.int32, device=dev)
+        n_dirichlet = self._dirichlet_idx.shape[0]
+        n_dof = self.ancf.n_nodes * 6
+        N = self.n_envs
+
+        # DOF mask over the flat [N*n_dof] vectors: 1 free, 0 pinned.
+        self._dirichlet_dof_mask = wp.full(N * n_dof, 1.0, dtype=float, device=dev)
+        wp.launch(
+            _build_dirichlet_dof_mask,
+            dim=n_dirichlet,
+            inputs=[self._dirichlet_idx, self._dirichlet_dof_mask],
+            device=dev,
+        )
+
+        # Per-value mask over bsr_values_batched [N*nnz] in the blocked layout.
+        self.pcg.coarse_free = self._dirichlet_dof_mask
+        self._dirichlet_nnz_mask = wp.full(N * self._nnz, 1.0, dtype=float, device=dev)
+        wp.launch(
+            _build_dirichlet_nnz_mask_blk,
+            dim=N * n_dof,
+            inputs=[
+                self._dirichlet_dof_mask,
+                self.blk_offsets,
+                self.blk_columns,
+                n_dof,
+                self._nnz,
+                self._dirichlet_nnz_mask,
+            ],
+            device=dev,
+        )
+
+    def _launch_dirichlet_pred_override(self, dt: float) -> None:
+        wp.launch(
+            _dirichlet_pred_override,
+            dim=self._dirichlet_idx.shape[0],
+            inputs=[
+                self._dirichlet_idx,
+                self.node_x,
+                self.node_xd,
+                self.node_D,
+                self.node_Dd,
+                self.node_xdd,
+                self.node_Ddd,
+                dt,
+                HHT_BETA,
+                HHT_GAMMA,
+                self.x_pred,
+                self.xd_pred,
+                self.D_pred,
+                self.Dd_pred,
+            ],
+            device=self.device,
+        )
+
+    # ------------------------------------------------------------------
+    def _init_keff_structure(self):
+        """Compile stiffness kernel, assemble K_t at the reference config to fix the
+        sparsity, then derive the node-block CSR + element->block scatter map used for
+        graph-capture-safe in-place updates."""
+        dev = self.device
+        ne = self.ancf.n_elems
+
+        self.elem_f.zero_()
+        self.elem_K.zero_()
+        with _CompileProgress(f"stiffness kernel  ({ne} elem)", enabled=self.verbose):
+            wp.launch(
+                compute_element_forces_stiffness,
+                dim=ne,
+                inputs=[
+                    self.ancf.node_x0,
+                    self.ancf.node_D0,
+                    self.node_xd,
+                    self.node_Dd,
+                    self.ancf.node_x0,
+                    self.ancf.node_D0,
+                    self.ancf.elem_nodes,
+                    self.ancf.elem_h,
+                    self.ancf.elem_mat,
+                    self.elem_f,
+                    self.elem_K,
+                    self.gp_bd_single,
+                    self.gp_bs0_single,
+                    self.gp_b13_single,
+                    self.gp_b23_single,
+                    self.ancf.elem_eas_alpha,
+                    self.ancf.elem_fiber_cos,
+                    self.ancf.elem_fiber_sin,
+                    self.thickness_gp,
+                    self.elem_det_J0c,
+                    self.elem_T0c0_d,
+                    self.elem_T0c0_s,
+                    self.elem_T0c1_d,
+                    self.elem_T0c1_s,
+                    self.elem_T0c2_d,
+                    self.elem_T0c2_s,
+                    self.elem_T0c3_d,
+                    self.elem_T0c3_s,
+                    self.elem_J0inv_a,
+                    self.elem_J0inv_b,
+                    self.elem_J0inv_cc,
+                    self.elem_J0inv_d,
+                    self.elem_J0inv_tA,
+                    self.elem_J0inv_tB,
+                    self.elem_J0inv_tC,
+                    self.elem_J0inv_tD,
+                    False,
+                ],
+                device=dev,
+            )
+            wp.synchronize_device(dev)
+
+        # Assemble the sparsity from K_t only (the lumped mass is diagonal and the diagonal
+        # is always present).  elem_K is [N*n_elems] in batched mode but the sparsity is per
+        # env, so pass only the first env's block: the triplet capacity sets the per-env
+        # value stride.  The scalar CSR is only needed to derive the blocked structure.
+        K_eff = assemble_sparse_stiffness(self.ancf.elem_nodes, self.elem_K[:ne], self.ancf.n_nodes, dev)
+
+        # Node-block (6x6) CSR derived from the scalar sparsity; the solve, the in-place
+        # refill and the Dirichlet mask all use this layout (see kernels_assembly).
+        with _CompileProgress("scatter map", enabled=self.verbose):
+            self.blk_offsets, self.blk_columns, self.blk_scatter_map, self._nnzb = build_block_structure(
+                self.ancf.elem_nodes, K_eff, self.ancf.n_nodes, dev
+            )
+
+        self._gather_maps = kernels_gather.incidence_maps(
+            self.ancf.elem_nodes.numpy(), self.blk_scatter_map.numpy(), self.ancf.n_nodes, self._nnzb, dev
+        )
+
+    # ------------------------------------------------------------------
+    def _update_K_eff_inplace_batched(self, scale_K: float) -> None:
+        """Zero the blocked values and refill from elem_K + lumped mass in place.
+
+        K_eff = (1/β/dt²)·M_lump + (1+α)·K_t for each of the N envs, written into
+        bsr_values_batched[N*nnz]; M_lump is diagonal (lumped_mass_scaled = lumped_mass/β/dt²,
+        precomputed in capture_graph).  No allocation — safe inside a CUDA graph capture.
+        """
+        dev = self.device
+        N = self.n_envs
+        ne = self.ancf.n_elems
+        n_dof = self.ancf.n_nodes * 6
+        nnz = self._nnz
+        wp.launch(
+            kernels_gather.stiffness,
+            dim=N * nnz,
+            inputs=[*self._gather_maps[2:], self.elem_K, scale_K, self.bsr_values_batched, self._nnzb, ne],
+            device=dev,
+        )
+        wp.launch(
+            add_diag_to_blk_values_batched,
+            dim=N * n_dof,
+            inputs=[
+                self.lumped_mass_scaled_tiled,
+                self.blk_offsets,
+                self.blk_columns,
+                self.bsr_values_batched,
+                n_dof,
+                nnz,
+            ],
+            device=dev,
+        )
+
+    # ------------------------------------------------------------------
+    def _precompute_mass(self):
+        """Compute lumped (diagonal) mass directly from element volumes.
+
+        Lump translation and director blocks separately using their physical
+        shape-function weights. Cross-block mass couplings are omitted; this
+        is a diagonal approximation to the consistent ANCF mass matrix.
+        """
+        dev = self.device
+        ne = self.ancf.n_elems
+        with _CompileProgress(f"lumped mass  ({ne} elem)", enabled=self.verbose):
+            wp.launch(
+                compute_lumped_mass,
+                dim=ne,
+                inputs=[
+                    self.ancf.node_x0,
+                    self.ancf.node_D0,
+                    self.ancf.elem_nodes,
+                    self.ancf.elem_h,
+                    self.ancf.elem_mat,
+                    self.lumped_mass,
+                ],
+                device=dev,
+            )
+            wp.synchronize_device(dev)
+
+    def _precompute_rest_jacobians(self):
+        """Compute per-element rest-configuration Jacobian inverses + EAS T0 basis once.
+
+        These depend only on the rest configuration (node_x0/node_D0) and the
+        fiber angle, never on the deformed state, so they are evaluated once
+        here instead of in every force/stiffness call. See compute_rest_jacobians.
+        """
+        dev = self.device
+        ne = self.ancf.n_elems
+        wp.launch(
+            compute_rest_jacobians,
+            dim=ne,
+            inputs=[
+                self.ancf.node_x0,
+                self.ancf.node_D0,
+                self.ancf.elem_nodes,
+                self.ancf.elem_h,
+                self.ancf.elem_fiber_cos,
+                self.ancf.elem_fiber_sin,
+            ],
+            outputs=[
+                self.elem_det_J0c,
+                self.elem_T0c0_d,
+                self.elem_T0c0_s,
+                self.elem_T0c1_d,
+                self.elem_T0c1_s,
+                self.elem_T0c2_d,
+                self.elem_T0c2_s,
+                self.elem_T0c3_d,
+                self.elem_T0c3_s,
+                self.elem_J0inv_a,
+                self.elem_J0inv_b,
+                self.elem_J0inv_cc,
+                self.elem_J0inv_d,
+                self.elem_J0inv_tA,
+                self.elem_J0inv_tB,
+                self.elem_J0inv_tC,
+                self.elem_J0inv_tD,
+            ],
+            device=dev,
+        )
+        wp.synchronize_device(dev)
+
+    # ------------------------------------------------------------------
+    def _evaluate_forces_single(self, dt: float, update_eas: bool = False) -> None:
+        dev = self.device
+        n = self.ancf.n_nodes
+        ne = self.ancf.n_elems
+        n_dof = n * 6
+        beta, gamma = HHT_BETA, HHT_GAMMA
+        self.elem_f.zero_()
+        self.elem_K.zero_()
+        wp.launch(
+            compute_element_forces_stiffness,
+            dim=ne,
+            inputs=[
+                self.node_x,
+                self.node_D,
+                self.node_xd,
+                self.node_Dd,
+                self.ancf.node_x0,
+                self.ancf.node_D0,
+                self.ancf.elem_nodes,
+                self.ancf.elem_h,
+                self.ancf.elem_mat,
+                self.elem_f,
+                self.elem_K,
+                self.gp_bd_single,
+                self.gp_bs0_single,
+                self.gp_b13_single,
+                self.gp_b23_single,
+                self.ancf.elem_eas_alpha,
+                self.ancf.elem_fiber_cos,
+                self.ancf.elem_fiber_sin,
+                self.thickness_gp,
+                self.elem_det_J0c,
+                self.elem_T0c0_d,
+                self.elem_T0c0_s,
+                self.elem_T0c1_d,
+                self.elem_T0c1_s,
+                self.elem_T0c2_d,
+                self.elem_T0c2_s,
+                self.elem_T0c3_d,
+                self.elem_T0c3_s,
+                self.elem_J0inv_a,
+                self.elem_J0inv_b,
+                self.elem_J0inv_cc,
+                self.elem_J0inv_d,
+                self.elem_J0inv_tA,
+                self.elem_J0inv_tB,
+                self.elem_J0inv_tC,
+                self.elem_J0inv_tD,
+                update_eas,
+            ],
+            device=dev,
+            # A tire has only a few hundred elements; small blocks distribute
+            # this register-heavy, one-thread-per-element kernel across SMs.
+            block_dim=8,
+        )
+        self._update_cavity_volume()
+        self._launch_cavity_gas_law(dev)
+        # Follower pressure force at the current iterate (gauge from gas law).
+        self.elem_fp.zero_()
+        wp.launch(
+            compute_pressure_force_stiffness,
+            dim=self.ancf.n_elems,
+            inputs=[self.node_x, self.ancf.elem_nodes, self.elem_psign, self.pressure, self.elem_fp],
+            device=dev,
+        )
+
+        self.global_f_int.zero_()
+        wp.launch(
+            kernels_gather.forces,
+            dim=n_dof,
+            inputs=[*self._gather_maps[:2], self.elem_f, self.global_f_int, n, self.ancf.n_elems],
+            device=dev,
+        )
+
+        self.global_f_ext.zero_()
+        wp.launch(
+            _assemble_rhs_gravity,
+            dim=n_dof,
+            inputs=[self.lumped_mass, self._gravity, self.global_f_ext],
+            device=dev,
+        )
+        # External follower-pressure load scattered into f_ext.
+        wp.launch(
+            kernels_gather.forces,
+            dim=n_dof,
+            inputs=[*self._gather_maps[:2], self.elem_fp, self.global_f_ext, n, self.ancf.n_elems],
+            device=dev,
+        )
+        wp.launch(zero_contact_diag, dim=n_dof, inputs=[self.K_contact_diag], device=dev)
+        wp.launch(zero_contact_blk, dim=n, inputs=[self.K_contact_blk], device=dev)
+        wp.launch(
+            apply_ground_contact,
+            dim=n,
+            inputs=[
+                self.node_x,
+                self.node_xd,
+                self.ground_z,
+                self.kn,
+                self.kd,
+                self.mu,
+                self.v_reg,
+                float(gamma / (beta * dt)),
+                self.global_f_ext,
+                self.K_contact_diag,
+            ],
+            device=dev,
+        )
+        if self.terrain is not None:
+            self.terrain.apply_contact(
+                self.node_x,
+                self.node_xd,
+                self.kn,
+                self.kd,
+                self.v_reg,
+                float(gamma / (beta * dt)),
+                self.global_f_ext,
+                self.K_contact_diag,
+            )
+        if self.rigid_contact is not None:
+            self.rigid_contact.apply_contact(
+                self.node_x,
+                self.node_xd,
+                self.kn,
+                self.kd,
+                self.v_reg,
+                float(gamma / (beta * dt)),
+                self.global_f_ext,
+                self.K_contact_diag,
+                self.K_contact_blk,
+            )
+        wp.launch(_add_node_f_ext_persistent, dim=n, inputs=[self.node_f_ext_persistent, self.global_f_ext], device=dev)
+
+    def _assemble_element_stiffness_batched(self) -> None:
+        """Assemble B^T C B from the latest force evaluation for a Newton correction."""
+        wp.launch(
+            compute_element_K_from_B,
+            dim=self.n_envs * self.ancf.n_elems * 36,
+            block_dim=self._stiffness_block_dim,
+            inputs=[
+                self.gp_bd,
+                self.gp_bs0,
+                self.gp_b13,
+                self.gp_b23,
+                self.gp_w,
+                self.ancf.elem_mat,
+                self.elem_K,
+                self.n_gp_total,
+            ],
+            device=self.device,
+        )
+
+    def _evaluate_forces_batched(self, dt: float, *, assemble_tangent: bool = True) -> None:
+        """Evaluate current forces and optionally assemble the element tangent."""
+        dev = self.device
+        n = self.ancf.n_nodes
+        ne = self.ancf.n_elems
+        n_dof = n * 6
+        N = self.n_envs
+        Nn, Nne, Nndof = N * n, N * ne, N * n_dof
+        beta, gamma = HHT_BETA, HHT_GAMMA
+        # elem_K needs no zeroing: compute_element_K_from_B assigns every entry.
+        wp.launch(
+            compute_element_forces_stiffness_batched_gp,
+            dim=Nne * self.n_gp_total,
+            block_dim=self._force_block_dim,
+            inputs=[
+                self.node_x,
+                self.node_D,
+                self.node_xd,
+                self.node_Dd,
+                self.ancf.node_x0,
+                self.ancf.node_D0,
+                self.ancf.elem_nodes,
+                self.ancf.elem_h,
+                self.ancf.elem_mat,
+                self.gp_force,
+                self.elem_K,
+                self.gp_bd,
+                self.gp_bs0,
+                self.gp_b13,
+                self.gp_b23,
+                self.gp_w,
+                self.ancf.elem_fiber_cos,
+                self.ancf.elem_fiber_sin,
+                ne,
+                n,
+                self.n_gp_total,
+                self.thickness_gp,
+                self.elem_J0inv_a,
+                self.elem_J0inv_b,
+                self.elem_J0inv_cc,
+                self.elem_J0inv_d,
+                self.elem_J0inv_tA,
+                self.elem_J0inv_tB,
+                self.elem_J0inv_tC,
+                self.elem_J0inv_tD,
+            ],
+            device=dev,
+        )
+        wp.launch(
+            sum_element_quadrature_forces,
+            dim=(Nne, 24),
+            inputs=[self.gp_force, self.n_gp_total, self.elem_f],
+            device=dev,
+        )
+        if assemble_tangent:
+            self._assemble_element_stiffness_batched()
+        self._update_cavity_volume()
+        self._launch_cavity_gas_law(dev)
+        # Follower pressure force at the current iterate (gauge from gas law).
+        self.elem_fp.zero_()
+        wp.launch(
+            kernels_gather.pressure,
+            dim=Nne,
+            block_dim=32,
+            inputs=[
+                self.node_x,
+                self.ancf.elem_nodes,
+                self.elem_psign,
+                self.pressure,
+                self.elem_fp,
+                ne,
+                n,
+            ],
+            device=dev,
+        )
+
+        self.global_f_int.zero_()
+        wp.launch(
+            kernels_gather.forces,
+            dim=Nndof,
+            inputs=[*self._gather_maps[:2], self.elem_f, self.global_f_int, n, ne],
+            device=dev,
+        )
+
+        self.global_f_ext.zero_()
+        wp.launch(
+            _assemble_rhs_gravity,
+            dim=Nndof,
+            inputs=[self.lumped_mass_tiled, self._gravity, self.global_f_ext],
+            device=dev,
+        )
+        # External follower-pressure load scattered into f_ext.
+        wp.launch(
+            kernels_gather.forces,
+            dim=Nndof,
+            inputs=[*self._gather_maps[:2], self.elem_fp, self.global_f_ext, n, ne],
+            device=dev,
+        )
+        wp.launch(zero_contact_diag, dim=Nndof, inputs=[self.K_contact_diag], device=dev)
+        wp.launch(zero_contact_blk, dim=Nn, inputs=[self.K_contact_blk], device=dev)
+        wp.launch(
+            apply_ground_contact_batched,
+            dim=Nn,
+            inputs=[
+                self.node_x,
+                self.node_xd,
+                self.ground_z,
+                self.kn,
+                self.kd,
+                self.mu,
+                self.v_reg,
+                float(gamma / (beta * dt)),
+                self.global_f_ext,
+                self.K_contact_diag,
+                n,
+            ],
+            device=dev,
+        )
+        if self.terrain is not None:
+            self.terrain.apply_contact(
+                self.node_x,
+                self.node_xd,
+                self.kn,
+                self.kd,
+                self.v_reg,
+                float(gamma / (beta * dt)),
+                self.global_f_ext,
+                self.K_contact_diag,
+            )
+        if self.rigid_contact is not None:
+            self.rigid_contact.apply_contact(
+                self.node_x,
+                self.node_xd,
+                self.kn,
+                self.kd,
+                self.v_reg,
+                float(gamma / (beta * dt)),
+                self.global_f_ext,
+                self.K_contact_diag,
+                self.K_contact_blk,
+            )
+        wp.launch(
+            _add_node_f_ext_persistent, dim=Nn, inputs=[self.node_f_ext_persistent, self.global_f_ext], device=dev
+        )
+
+    def _step_single(self, dt: float) -> None:
+        """Single-environment (N=1) HHT step."""
+        dev = self.device
+        n = self.ancf.n_nodes
+        n_dof = n * 6
+        alpha = HHT_ALPHA
+        beta = HHT_BETA
+        gamma = HHT_GAMMA
+
+        wp.copy(self.global_f_int0, self.global_f_int)
+        wp.copy(self.global_f_ext0, self.global_f_ext)
+
+        if self.terrain is not None:
+            self.terrain.update_plastic(self.node_x, self.node_xd, self.kn, dt)
+
+        wp.launch(_zero_eas_alpha, dim=self.ancf.n_elems, inputs=[self.ancf.elem_eas_alpha], device=dev)
+
+        wp.launch(
+            hht_predict,
+            dim=n,
+            inputs=[self.node_x, self.node_xd, self.node_xdd, dt, beta, gamma],
+            outputs=[self.x_pred, self.xd_pred],
+            device=dev,
+        )
+        wp.launch(
+            hht_predict,
+            dim=n,
+            inputs=[self.node_D, self.node_Dd, self.node_Ddd, dt, beta, gamma],
+            outputs=[self.D_pred, self.Dd_pred],
+            device=dev,
+        )
+        if self._dirichlet_idx is not None:
+            self._launch_dirichlet_pred_override(dt)
+
+        # K_eff Jacobian correction for stiffness-proportional Rayleigh damping.
+        # f_damp = α_d·K·v where v = xd_pred + γ·dt·a  →  ∂f_damp/∂a = α_d·K·γ·dt.
+        # The (1+α) HHT scale and the 1/(β·dt²) division give:
+        #   K_eff += (1+α)·α_d·K·(γ/(β·dt))
+        # Without this, K_eff is ~175x too small at dt≈1.67ms, α_d=0.15,
+        # so each NR step overshoots by ~175x and the iteration diverges.
+        scale_K_Keff = stiffness_scale(dt, self._alpha_damp, alpha, beta, gamma)
+
+        for _nr in range(self.nr_max_iter):
+            wp.launch(
+                hht_kinematic,
+                dim=n,
+                inputs=[self.x_pred, self.xd_pred, self.node_xdd, dt, beta, gamma],
+                outputs=[self.node_x, self.node_xd],
+                device=dev,
+            )
+            wp.launch(
+                hht_kinematic,
+                dim=n,
+                inputs=[self.D_pred, self.Dd_pred, self.node_Ddd, dt, beta, gamma],
+                outputs=[self.node_D, self.node_Dd],
+                device=dev,
+            )
+
+            self._evaluate_forces_single(dt, update_eas=True)
+
+            wp.launch(flatten_vec3_pair, dim=n, inputs=[self.node_xdd, self.node_Ddd, self.a_flat], device=dev)
+            wp.launch(pointwise_mul, dim=n_dof, inputs=[self.lumped_mass, self.a_flat, self.M_a], device=dev)
+
+            wp.launch(
+                build_residual,
+                dim=n_dof,
+                inputs=[
+                    self.M_a,
+                    self.global_f_int,
+                    self.global_f_int0,
+                    self.global_f_ext,
+                    self.global_f_ext0,
+                    alpha,
+                    self.residual,
+                ],
+                device=dev,
+            )
+            if self._dirichlet_idx is not None:
+                wp.launch(mask_dof, dim=n_dof, inputs=[self._dirichlet_dof_mask, self.residual], device=dev)
+
+            if self.debug_residuals:
+                wp.launch(_zero_nr_slot, dim=1, inputs=[self._nr_res_hist, _nr, self.nr_max_iter], device=dev)
+                wp.launch(
+                    _accum_nr_residual_sq,
+                    dim=n_dof,
+                    inputs=[self.residual, self._nr_res_hist, _nr, self.nr_max_iter, n_dof],
+                    device=dev,
+                )
+
+            self._update_K_eff_inplace_batched(scale_K_Keff)
+
+            wp.launch(
+                pointwise_scale,
+                dim=self.K_contact_diag.shape[0],
+                inputs=[self.K_contact_diag, float(1.0 + alpha), self.K_contact_diag],
+                device=dev,
+            )
+            wp.launch(
+                add_diag_to_blk_values_batched,
+                dim=n_dof,
+                inputs=[
+                    self.K_contact_diag,
+                    self.blk_offsets,
+                    self.blk_columns,
+                    self.bsr_values_batched,
+                    n_dof,
+                    self._nnz,
+                ],
+                device=dev,
+            )
+            wp.launch(
+                add_blk_to_blk_values_batched,
+                dim=n,
+                inputs=[
+                    self.K_contact_blk,
+                    float(1.0 + alpha),
+                    self.blk_offsets,
+                    self.blk_columns,
+                    self.bsr_values_batched,
+                    n,
+                    self._nnz,
+                ],
+                device=dev,
+            )
+            if self._dirichlet_idx is not None:
+                wp.launch(
+                    apply_dirichlet_to_bsr,
+                    dim=self._nnz,
+                    inputs=[self._dirichlet_nnz_mask, self.bsr_values_batched],
+                    device=dev,
+                )
+
+            self.da.zero_()
+            wp.launch(negate, dim=n_dof, inputs=[self.residual, self.neg_R], device=dev)
+            self.pcg.solve(
+                self.blk_offsets,
+                self.blk_columns,
+                self.bsr_values_batched,
+                self.neg_R,
+                self.da,
+                compute_residual_report=self.debug_residuals,
+            )
+
+            wp.launch(
+                _apply_acceleration_update,
+                dim=n,
+                inputs=[self.da, float(1.0 / (beta * dt * dt)), self.node_xdd, self.node_Ddd],
+                device=dev,
+            )
+
+        wp.launch(
+            hht_kinematic,
+            dim=n,
+            inputs=[self.x_pred, self.xd_pred, self.node_xdd, dt, beta, gamma],
+            outputs=[self.node_x, self.node_xd],
+            device=dev,
+        )
+        wp.launch(
+            hht_kinematic,
+            dim=n,
+            inputs=[self.D_pred, self.Dd_pred, self.node_Ddd, dt, beta, gamma],
+            outputs=[self.node_D, self.node_Dd],
+            device=dev,
+        )
+
+        self._evaluate_forces_single(dt)
+
+    # ------------------------------------------------------------------
+    def _step_batched(self, dt: float) -> None:
+        """Multi-env (N>1) HHT step — all arrays flat [N*per_env]."""
+        dev = self.device
+        n = self.ancf.n_nodes
+        n_dof = n * 6
+        N = self.n_envs
+        Nn = N * n
+        Nndof = N * n_dof
+        alpha = HHT_ALPHA
+        beta = HHT_BETA
+        gamma = HHT_GAMMA
+
+        wp.copy(self.global_f_int0, self.global_f_int)
+        wp.copy(self.global_f_ext0, self.global_f_ext)
+
+        if self.terrain is not None:
+            self.terrain.update_plastic(self.node_x, self.node_xd, self.kn, dt)
+
+        wp.launch(
+            hht_predict,
+            dim=Nn,
+            inputs=[self.node_x, self.node_xd, self.node_xdd, dt, beta, gamma],
+            outputs=[self.x_pred, self.xd_pred],
+            device=dev,
+        )
+        wp.launch(
+            hht_predict,
+            dim=Nn,
+            inputs=[self.node_D, self.node_Dd, self.node_Ddd, dt, beta, gamma],
+            outputs=[self.D_pred, self.Dd_pred],
+            device=dev,
+        )
+        _dirichlet = self._dirichlet_idx is not None
+        if _dirichlet:
+            self._launch_dirichlet_pred_override(dt)
+
+        scale_K_Keff = stiffness_scale(dt, self._alpha_damp, alpha, beta, gamma)
+
+        for _nr in range(self.nr_max_iter):
+            wp.launch(
+                hht_kinematic,
+                dim=Nn,
+                inputs=[self.x_pred, self.xd_pred, self.node_xdd, dt, beta, gamma],
+                outputs=[self.node_x, self.node_xd],
+                device=dev,
+            )
+            wp.launch(
+                hht_kinematic,
+                dim=Nn,
+                inputs=[self.D_pred, self.Dd_pred, self.node_Ddd, dt, beta, gamma],
+                outputs=[self.node_D, self.node_Dd],
+                device=dev,
+            )
+
+            self._evaluate_forces_batched(dt)
+
+            wp.launch(flatten_vec3_pair, dim=Nn, inputs=[self.node_xdd, self.node_Ddd, self.a_flat], device=dev)
+            wp.launch(pointwise_mul, dim=Nndof, inputs=[self.lumped_mass_tiled, self.a_flat, self.M_a], device=dev)
+
+            wp.launch(
+                build_residual,
+                dim=Nndof,
+                inputs=[
+                    self.M_a,
+                    self.global_f_int,
+                    self.global_f_int0,
+                    self.global_f_ext,
+                    self.global_f_ext0,
+                    alpha,
+                    self.residual,
+                ],
+                device=dev,
+            )
+            if _dirichlet:
+                wp.launch(mask_dof, dim=Nndof, inputs=[self._dirichlet_dof_mask, self.residual], device=dev)
+
+            if self.debug_residuals:
+                wp.launch(_zero_nr_slot, dim=N, inputs=[self._nr_res_hist, _nr, self.nr_max_iter], device=dev)
+                wp.launch(
+                    _accum_nr_residual_sq,
+                    dim=Nndof,
+                    inputs=[self.residual, self._nr_res_hist, _nr, self.nr_max_iter, n_dof],
+                    device=dev,
+                )
+
+            self._update_K_eff_inplace_batched(scale_K_Keff)
+
+            wp.launch(
+                pointwise_scale,
+                dim=self.K_contact_diag.shape[0],
+                inputs=[self.K_contact_diag, float(1.0 + alpha), self.K_contact_diag],
+                device=dev,
+            )
+            wp.launch(
+                add_diag_to_blk_values_batched,
+                dim=Nndof,
+                inputs=[
+                    self.K_contact_diag,
+                    self.blk_offsets,
+                    self.blk_columns,
+                    self.bsr_values_batched,
+                    n_dof,
+                    self._nnz,
+                ],
+                device=dev,
+            )
+            wp.launch(
+                add_blk_to_blk_values_batched,
+                dim=Nn,
+                inputs=[
+                    self.K_contact_blk,
+                    float(1.0 + alpha),
+                    self.blk_offsets,
+                    self.blk_columns,
+                    self.bsr_values_batched,
+                    n,
+                    self._nnz,
+                ],
+                device=dev,
+            )
+            if _dirichlet:
+                wp.launch(
+                    apply_dirichlet_to_bsr,
+                    dim=N * self._nnz,
+                    inputs=[self._dirichlet_nnz_mask, self.bsr_values_batched],
+                    device=dev,
+                )
+
+            self.da.zero_()
+            wp.launch(negate, dim=Nndof, inputs=[self.residual, self.neg_R], device=dev)
+            self.pcg.solve(
+                self.blk_offsets,
+                self.blk_columns,
+                self.bsr_values_batched,
+                self.neg_R,
+                self.da,
+                compute_residual_report=self.debug_residuals,
+            )
+
+            wp.launch(
+                _apply_acceleration_update,
+                dim=Nn,
+                inputs=[self.da, float(1.0 / (beta * dt * dt)), self.node_xdd, self.node_Ddd],
+                device=dev,
+            )
+
+        wp.launch(
+            hht_kinematic,
+            dim=Nn,
+            inputs=[self.x_pred, self.xd_pred, self.node_xdd, dt, beta, gamma],
+            outputs=[self.node_x, self.node_xd],
+            device=dev,
+        )
+        wp.launch(
+            hht_kinematic,
+            dim=Nn,
+            inputs=[self.D_pred, self.Dd_pred, self.node_Ddd, dt, beta, gamma],
+            outputs=[self.node_D, self.node_Dd],
+            device=dev,
+        )
+
+        self._evaluate_forces_batched(dt)
+
+    # ------------------------------------------------------------------
+    def step(
+        self,
+        state_in: State,
+        state_out: State,
+        control: Control | None,
+        contacts: Contacts | None,
+        dt: float,
+    ) -> None:
+        """Advance ANCF state by one HHT-alpha step with fixed-count NR.
+
+        The method is graph-capturable: no host-device syncs, no allocations,
+        fixed iteration counts.  Call ``capture_graph()`` once after warm-up,
+        then replace ``step()`` calls with ``graph_step()`` for best performance.
+        """
+        if self.n_envs > 1:
+            self._step_batched(dt)
+        else:
+            self._step_single(dt)
+
+    # ------------------------------------------------------------------
+    def residual_report(self, env: int = 0) -> str:
+        """One-line convergence summary for the last completed step.
+
+        Requires :attr:`debug_residuals` to have been ``True`` before
+        :meth:`capture_graph`.  Call from the frame loop *outside* the CUDA
+        graph -- it reads device memory back to the host.
+
+        Reports, per Newton-Raphson iteration, ``||R||`` (the HHT residual the
+        NR step is driving to zero) and the ratio to the previous iteration.
+        A converging Newton solve shows the ratio falling well below 1; ratios
+        near or above 1 mean the iteration is not converging and the step being
+        taken is not a descent direction.
+
+        Also reports the PCG reduction ``||r||_final / ||r||_initial`` for the
+        last linear solve of the step -- how well the *linear* system was
+        solved, independent of whether Newton itself is converging.
+
+        Args:
+            env: Environment index to report (batched solves hold one history
+                per environment).
+
+        Returns:
+            Formatted single-line report.
+        """
+        if not self.debug_residuals:
+            return "[ancf] residual_report: set solver.debug_residuals = True before capture_graph()"
+
+        nr = self.nr_max_iter
+        h = self._nr_res_hist.numpy()[env * nr : (env + 1) * nr]
+        norms = [float(v) ** 0.5 for v in h]
+
+        parts, prev = [], None
+        for i, v in enumerate(norms):
+            if prev is not None and prev > 0.0:
+                parts.append(f"NR{i}={v:.3e}({v / prev:.2f}x)")
+            else:
+                parts.append(f"NR{i}={v:.3e}")
+            prev = v
+
+        rz_i = float(self.pcg.rz_init.numpy()[env])
+        rz_f = float(self.pcg.rz_last.numpy()[env])
+        pcg = (rz_f / rz_i) ** 0.5 if rz_i > 0.0 else float("nan")
+        return f"[ancf env{env}] " + "  ".join(parts) + f"  |  PCG (before coarse correction) {pcg:.2e}"
+
+    def capture_graph(self, dt: float) -> None:
+        """Capture one ``step(dt)`` as a replayable CUDA graph.
+
+        Args:
+            dt: Integration time step [s].  Must stay constant between capture
+                and all subsequent ``graph_step()`` calls.
+
+        Call once after construction (kernels are already compiled by
+        ``_init_keff_structure``).  Subsequent simulation frames should call
+        ``graph_step()`` instead of ``step()``.
+        """
+        dev = self.device
+        n_dof = self.ancf.n_nodes * 6
+        N = self.n_envs
+
+        # Precompute lumped_mass_scaled = lumped_mass / (β·dt²).
+        # Constant for fixed dt — outside the captured region (read-only inside).
+        scale_M = 1.0 / (HHT_BETA * dt * dt)
+        wp.launch(
+            pointwise_scale,
+            dim=N * n_dof,
+            inputs=[self.lumped_mass_tiled, float(scale_M), self.lumped_mass_scaled_tiled],
+            device=dev,
+        )
+        wp.synchronize_device(dev)
+
+        label = f"CUDA graph capture  ({N} env × {self.nr_max_iter} NR × {self.pcg.max_iters} PCG, dt={dt:.2e} s)"
+        with _CompileProgress(label, enabled=self.verbose):
+            wp.capture_begin(device=dev)
+            self.step(None, None, None, None, dt)
+            self._graph = wp.capture_end(device=dev)
+
+    def graph_step(self) -> None:
+        """Replay the captured CUDA graph for one simulation step."""
+        if self._graph is None:
+            raise RuntimeError("Call capture_graph() before graph_step().")
+        wp.capture_launch(self._graph)

@@ -1,0 +1,510 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+###########################################################################
+# Example ANCF Shell Drop
+#
+# ANCF3423 shell tire(s) loaded from a baked USD asset (--tire-asset; e.g. the
+# Polaris 3-section orthotropic profile or the lugged Sherp carcass) dropped
+# from 1 m onto a rigid ground plane. Sealed-gas cavity per tire with a CTIS
+# slider; --n-envs batches independent tires in one solver instance.
+#
+# Solver: SolverANCFTire — implicit HHT-alpha (α=-0.2, β=0.36, γ=0.7)
+#   - 3-point elastic / 5-point mass through-thickness Gauss quadrature
+#   - ANS transverse-shear + ANS ε_zz correction
+#   - EAS in the single-tire branch; the batched branch keeps its modes zero
+#   - Authored penalty contact stiffness/damping; --kn overrides stiffness.
+#     --contact-penetration explicitly requests the drop-energy bound.
+#   - Node-block CSR K_eff updated in place (graph-capture safe)
+#   - Symmetric block Gauss-Seidel PCG with a rigid/scaling coarse correction
+#
+# Materials: the asset's baked per-section material ("E": null) or an isotropic
+#   override per tire. The reference (uninflated) geometry IS the inflated
+#   shape — elastic forces restore the tire to its baked profile.
+#
+# Command: python -m newton_solver_ancf.examples ancf_shell_drop
+###########################################################################
+
+"""Drop the small 60-quad shell ball onto a frictional floor; choose other shells from the asset menu."""
+
+import json
+import os
+
+import newton
+import newton.examples
+import numpy as np
+import warp as wp
+
+from newton_solver_ancf import SolverANCFTire, isotropic_ancf_material, load_ancf_tire_usd
+from newton_solver_ancf.examples._ancf_viz import material_row, quad_triangles
+from newton_solver_ancf.examples._capture_utils import reset_ancf_state, try_capture
+from newton_solver_ancf.examples._shell_assets import ASSET_DIR, configure_drop
+from newton_solver_ancf.examples._vehicle_kernels import gather_contact_spikes
+
+# Tire nodes, quad connectivity, thickness, and material layout are loaded
+# from an authored USD asset.
+
+
+@wp.kernel
+def _world_positions(local: wp.array[wp.vec3], origins: wp.array[wp.vec3], n_nodes: int, world: wp.array[wp.vec3]):
+    i = wp.tid()
+    world[i] = local[i] + origins[i // n_nodes]
+
+
+class Example:
+    """ANCF shell tire(s) dropped onto rigid terrain.
+
+    Pass ``--n-envs N`` to batch N independent tires in a single solver instance,
+    spaced 1 m apart along X.  Performance scales ~linearly up to ~20–30 envs.
+    """
+
+    def __init__(self, viewer, args):
+        self.viewer = viewer
+        self.sim_time = 0.0
+        self.fps = 60
+        self.frame_dt = 1.0 / self.fps
+        self.sim_substeps = int(args.substeps)
+        self.sim_dt = self.frame_dt / self.sim_substeps
+        self._diag_period = int(args.diag_period)
+
+        device = "cuda:0"
+
+        # ----------------------------------------------------------------
+        # Parse per-tire config from the --shell-tires JSON array (if provided).
+        # Falls back to a single tire with the asset's material when absent.
+        # ----------------------------------------------------------------
+        tires_raw = args.shell_tires
+        if isinstance(tires_raw, str):
+            tires_raw = json.loads(tires_raw)
+        if tires_raw:
+            tire_cfgs = [t for t in tires_raw if t.get("active", True)]
+        else:
+            # Default: one tire at the origin with the asset's baked material
+            tire_cfgs = [{"name": "reference", "position": [0.0, 0.0, 0.0]}]
+
+        # --n-envs above the number of configured tires replicates them (cycling the
+        # materials) 1 m apart along X — the batched-solver workload for profiling.
+        n_envs_arg = int(args.n_envs or 1)
+        if n_envs_arg > len(tire_cfgs):
+            base_cfgs = tire_cfgs
+            tire_cfgs = []
+            for i in range(n_envs_arg):
+                c = dict(base_cfgs[i % len(base_cfgs)])
+                c["position"] = [float(i), 0.0, 0.0]
+                c["name"] = f"{c.get('name', 'tire')}_{i}"
+                tire_cfgs.append(c)
+
+        n_envs = len(tire_cfgs)
+
+        # ----------------------------------------------------------------
+        # Load shared tire geometry (topology + reference positions) from the
+        # baked USD asset. All tires in a run share this same mesh; materials
+        # differ (below). --tire-asset selects a filename under assets/ or
+        # an absolute path.
+        # ----------------------------------------------------------------
+        tire_asset_arg = os.path.expanduser(args.tire_asset) if args.tire_asset else None
+        if not tire_asset_arg:
+            raise ValueError("--tire-asset is required (an authored ANCF tire USD)")
+        tire_asset_path = tire_asset_arg if os.path.isabs(tire_asset_arg) else str(ASSET_DIR / tire_asset_arg)
+        self.ancf_model, tire_meta = load_ancf_tire_usd(tire_asset_path, device=device)
+        self._asset_name = os.path.basename(tire_asset_path)
+        print(f"[ANCF] Asset: {self._asset_name} ({self.ancf_model.n_nodes} nodes, {self.ancf_model.n_elems} quads)")
+        R_outer = tire_meta.R_outer
+        kn = tire_meta.contact_kn if args.kn is None else args.kn
+        kd = tire_meta.contact_kd if args.kd is None else args.kd
+        # Retain legacy values for assets that predate contact metadata.
+        kn = float(2.0e3 if kn is None else kn)
+        kd = float(2.0 if kd is None else kd)
+
+        ne = self.ancf_model.n_elems
+        n_nodes = self.ancf_model.n_nodes
+
+        # ----------------------------------------------------------------
+        # Build per-tire elem_mat arrays, concatenate → [N*n_elems, 11].
+        # "E": null  →  the asset's baked per-section material.
+        # "E": float →  use isotropic_ancf_material(E, nu, rho).
+        # ----------------------------------------------------------------
+        base_mat_np = self.ancf_model.elem_mat.numpy()  # (n_elems, 11) the asset's material
+
+        per_env_mats = []
+        for cfg in tire_cfgs:
+            E = cfg.get("E", None)
+            nu = cfg.get("nu", None)
+            rho = cfg.get("rho", None)
+            if E is not None:
+                # Isotropic material — build a uniform mat for all elements
+                mat = isotropic_ancf_material(
+                    E=float(E),
+                    nu=float(nu) if nu is not None else 0.3,
+                    rho=float(rho) if rho is not None else 1100.0,
+                )
+                per_env_mats.append(np.tile(material_row(mat), (ne, 1)))
+            else:
+                # Baked material (copy base, optionally override rho)
+                env_mat = base_mat_np.copy()
+                if rho is not None:
+                    env_mat[:, 9] = float(rho)
+                per_env_mats.append(env_mat)
+
+        self.ancf_model.elem_mat = wp.array(np.concatenate(per_env_mats, axis=0), dtype=float, device=device)
+
+        # ----------------------------------------------------------------
+        # Per-tire world node positions = reference shape + offset + drop.
+        # JSON "position" = [x, y, z] world offset of the tire centroid.
+        # ----------------------------------------------------------------
+        x0_np = self.ancf_model.node_x0.numpy()  # (n_nodes, 3) reference
+        drop_height = R_outer + 1.0
+        world_x = np.empty((n_envs * n_nodes, 3), dtype=np.float32)
+        local_x = np.empty_like(world_x)
+        origins = np.zeros((n_envs, 3), dtype=np.float32)
+        for i, cfg in enumerate(tire_cfgs):
+            pos = cfg.get("position", [float(i), 0.0, 0.0])
+            off = np.array([float(pos[0]), float(pos[1]) + drop_height, float(pos[2])], dtype=np.float32)
+            # Flat-ground environments are independent. Keep X/Z origins out
+            # of the integration and element arithmetic; add them for display.
+            origins[i] = [off[0], 0.0, off[2]]
+            local_x[i * n_nodes : (i + 1) * n_nodes] = x0_np + np.array([0.0, off[1], 0.0], dtype=np.float32)
+            world_x[i * n_nodes : (i + 1) * n_nodes] = local_x[i * n_nodes : (i + 1) * n_nodes] + origins[i]
+        self._origins = wp.array(origins, dtype=wp.vec3, device=device)
+
+        # ----------------------------------------------------------------
+        # Newton model: ground plane + ALL tire nodes as particles, with the
+        # quad mesh registered as triangle elements so the viewer draws each
+        # tire as a surface via the standard log_state() pipeline.
+        # The ANCF solver owns the dynamics; these tris are render topology.
+        # ----------------------------------------------------------------
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        builder.add_ground_plane(color=(0.65, 0.65, 0.65))
+        builder.add_particles(
+            pos=[(float(p[0]), float(p[1]), float(p[2])) for p in world_x],
+            vel=[(0.0, 0.0, 0.0)] * (n_envs * n_nodes),
+            mass=[1.0] * (n_envs * n_nodes),
+            radius=[0.001] * (n_envs * n_nodes),
+        )
+
+        # Two triangles per quad element; tile node indices per tire.
+        tris_all = quad_triangles(self.ancf_model.elem_nodes.numpy(), n_nodes, n_envs)
+        builder.add_triangles(
+            i=tris_all[:, 0].tolist(),
+            j=tris_all[:, 1].tolist(),
+            k=tris_all[:, 2].tolist(),
+        )
+        self.model = builder.finalize(device=device)
+
+        # ----------------------------------------------------------------
+        # Implicit HHT integration with Newton and PCG.
+        # ----------------------------------------------------------------
+        self.solver = SolverANCFTire(
+            model=self.model,
+            ancf_model=self.ancf_model,
+            ground_z=0.0,
+            kn=kn,
+            kd=kd,
+            mu=0.9,
+            v_reg=1.0e-3,
+            nr_max_iter=int(args.nr_iters),
+            pcg_max_iter=int(args.pcg_iters or tire_meta.pcg_iters or 50),
+            n_envs=n_envs,
+        )
+        # Seed the solver node positions with the dropped/offset world layout.
+        self.solver.node_x.assign(local_x)
+
+        for i, cfg in enumerate(tire_cfgs):
+            if n_envs > 8 and 4 <= i < n_envs - 2:
+                if i == 4:
+                    print(f"[ANCF] ... {n_envs - 6} more tires ...")
+                continue
+            e = world_x[i * n_nodes : (i + 1) * n_nodes]
+            print(
+                f"[ANCF] env={i} ({cfg.get('name', '')})  "
+                f"centroid=({e[:, 0].mean():.3f},{e[:, 1].mean():.3f},{e[:, 2].mean():.3f})  "
+                f"y_min={e[:, 1].min():.3f}"
+            )
+
+        # For a rigid floor, penalty compliance is a numerical tolerance. A
+        # single contact spring that stores the complete initial gravitational
+        # energy bounds penetration conservatively; multiple nodes share it in practice.
+        tolerance = float(args.contact_penetration)
+        if tolerance <= 0:
+            raise ValueError("--contact-penetration must be positive")
+        if args.kn is None:
+            mass = self.solver.lumped_mass.numpy().reshape(n_nodes, 6)[:, 0].astype(np.float64)
+            heights = local_x.reshape(n_envs, n_nodes, 3)[:, :, 1].astype(np.float64)
+            drop_energy = 9.81 * np.sum(mass * (np.maximum(heights, 0.0) + tolerance), axis=1)
+            self.solver.kn = max(kn, float(2 * drop_energy.max() / tolerance**2))
+        contact_setting = f"drop-energy target={tolerance:g} m" if args.kn is None else "fixed stiffness"
+        print(f"[ANCF] contact kn={self.solver.kn:.6g} N/m ({contact_setting})")
+
+        self._n_nodes = n_nodes
+        self._n_envs = n_envs
+        # Capture ANCF inner graph (1 substep NR+PCG).
+        self.solver.capture_graph(self.sim_dt)
+
+        # ── Contact visualization (spike per penetrating node) ─────────────────
+        self._contact_line_s = wp.zeros(n_envs * n_nodes, dtype=wp.vec3, device=device)
+        self._contact_line_e = wp.zeros(n_envs * n_nodes, dtype=wp.vec3, device=device)
+        self._contact_vis_scale = 100.0  # tune per kn
+
+        # ── Combined substep frame graph ──────────────────────────────────────
+        # Captures all sim_substeps iterations into ONE CUDA graph launch per frame,
+        # eliminating Python loop overhead (same pattern as the vehicle examples).
+        # Uses solver.step() (unrolled NR+PCG) — graph_step() cannot be nested.
+        self._substep_graph = None
+        _dev = "cuda:0"
+        _dt = self.sim_dt
+
+        # Pre-warm solver.step() so kernels compile before capture_begin.
+        self.solver.step(None, None, None, None, _dt)
+        wp.synchronize_device(_dev)
+        # Restore state after pre-warm
+        reset_ancf_state(self.solver, self.ancf_model, local_x, np.tile(self.ancf_model.node_D0.numpy(), (n_envs, 1)))
+
+        def frame():
+            for _ in range(self.sim_substeps):
+                self.solver.step(None, None, None, None, _dt)
+
+        self._substep_graph = try_capture(
+            frame, "[ANCF] Frame graph capture failed ({error!r}) — using graph_step loop", _dev
+        )
+        if self._substep_graph is not None:
+            print(f"[ANCF] Frame graph captured {self.sim_substeps} substeps — 1 launch/frame ✓")
+
+        # Particle state holds ALL tire nodes; the viewer renders the surface.
+        self.state_0 = self.model.state()
+        self._update_world_positions()
+
+        # ----------------------------------------------------------------
+        # CTIS — sealed-gas cavity per tire.  The slider sets the NOMINAL
+        # pressure (the pressure the cavity holds at its reference volume), which
+        # maps to the air amount K_gas = p_nominal · V_ref.  The live pressure
+        # self-regulates as p = K_gas / V(x): inflate → volume grows → pressure
+        # eases off, so the sweep is stable.  The shell sees the gauge load
+        # (p − build_pressure); at the build pressure the load is zero and the
+        # tire holds its built shape.  The slider target ramps gradually.
+        # ----------------------------------------------------------------
+        self._tire_names = [cfg.get("name", f"tire{i}") for i, cfg in enumerate(tire_cfgs)]
+        self._build_pressure = [
+            float(tire_meta.pressure if cfg.get("pressure") is None else cfg["pressure"]) for cfg in tire_cfgs
+        ]
+        self._max_gauge = [float(cfg.get("max-gauge-pressure", 20000.0)) for cfg in tire_cfgs]
+        self._gauge_rate = [float(cfg.get("gauge-rate", 2000.0)) for cfg in tire_cfgs]
+        # Nominal-pressure slider bounds (clamped at 0 = fully deflated).
+        self._p_min = [max(0.0, self._build_pressure[i] - self._max_gauge[i]) for i in range(n_envs)]
+        self._p_max = [self._build_pressure[i] + self._max_gauge[i] for i in range(n_envs)]
+        self._target_pressure = list(self._build_pressure)
+        self._current_pressure = list(self._build_pressure)
+        # Seed the cavity so the first step replays with valid gas state.
+        self.solver.set_cavity(self._current_pressure, self._build_pressure)
+
+        if viewer is not None:
+            viewer.set_model(self.model)
+            # Camera centers on the midpoint of all tires.
+            xs = [cfg.get("position", [float(i)])[0] for i, cfg in enumerate(tire_cfgs)]
+            viewer.set_camera(
+                pos=wp.vec3(float(np.mean(xs)), 1.5, 3.0),
+                pitch=-15.0,
+                yaw=-90.0,
+            )
+
+        self._frame = 0
+
+    def step(self):
+        self._frame += 1
+
+        # Ramp the nominal cavity pressure toward the slider target (gradual),
+        # then update the sealed-gas cavity (air amount + build pressure).
+        for i in range(self._n_envs):
+            d = self._target_pressure[i] - self._current_pressure[i]
+            r = self._gauge_rate[i]
+            if abs(d) <= r:
+                self._current_pressure[i] = self._target_pressure[i]
+            else:
+                self._current_pressure[i] += r if d > 0.0 else -r
+        self.solver.set_cavity(self._current_pressure, self._build_pressure)
+
+        if self._substep_graph is not None:
+            wp.capture_launch(self._substep_graph)
+        else:
+            for _ in range(self.sim_substeps):
+                self.solver.graph_step()
+
+        self._update_world_positions()
+        self.sim_time += self.frame_dt
+
+        # Host readback of env-0 only every --diag-period frames.
+        if self._frame % self._diag_period == 0:
+            x_np = self._node_x().numpy()
+            xd_np = self._node_xd().numpy()
+            # Track env-0 (first tire) only
+            n = self._n_nodes
+            x0 = x_np[:n]
+            xd0 = xd_np[:n]
+            y_min = float(x0[:, 1].min())
+            y_max = float(x0[:, 1].max())
+            y_ctr = float(x0[:, 1].mean())
+            vy_min = float(xd0[:, 1].min())
+            vy_max = float(xd0[:, 1].max())
+            in_contact = y_min < 0.01
+            print(
+                f"[{self._frame:4d}]  y_ctr={y_ctr:.4f}  y_min={y_min:.4f}"
+                f"  y_max={y_max:.4f}  vy=[{vy_min:.3f},{vy_max:.3f}]"
+                f"  p={self._current_pressure[0]:.0f} Pa"
+                f"{'  CONTACT' if in_contact else ''}"
+            )
+
+    def _update_world_positions(self):
+        local = self.solver.node_x
+        wp.launch(
+            _world_positions,
+            dim=self._n_envs * self._n_nodes,
+            inputs=[local, self._origins, self._n_nodes, self.state_0.particle_q],
+            device=self.model.device,
+        )
+
+    def _node_x(self) -> wp.array:
+        """Current node positions in world coordinates [m]."""
+        return self.state_0.particle_q
+
+    def _node_xd(self) -> wp.array:
+        return self.solver.node_xd
+
+    def gui(self, ui):
+        """One nominal-pressure (CTIS) slider + live readout per tire [Pa].
+
+        Slider starts at the build pressure; drag down to deflate, up to inflate.
+        The sealed gas self-regulates the actual pressure as the tire deforms.
+        """
+        ui.text(f"Asset: {self._asset_name}")
+        ui.text("CTIS pressure  (down = deflate, up = inflate)")
+        ui.separator()
+        for i, name in enumerate(self._tire_names):
+            changed, value = ui.slider_float(
+                f"{name} [Pa]##{i}", self._target_pressure[i], self._p_min[i], self._p_max[i]
+            )
+            if changed:
+                self._target_pressure[i] = float(value)
+            # Commanded nominal pressure in Pa + psi (1 psi = 6894.76 Pa).
+            ui.text(
+                f"   {self._current_pressure[i]:8.0f} Pa"
+                f"   ({self._current_pressure[i] / 6894.76:.1f} psi)"
+                f"   build {self._build_pressure[i]:.0f}"
+            )
+
+    def render(self):
+        if self.viewer is None:
+            return
+        self.viewer.begin_frame(self.sim_time)
+        # All tires render through the standard model pipeline (particles + tris).
+        self.viewer.log_state(self.state_0)
+        # The model is built Y-up (``up_axis=newton.Axis.Y``), so the spikes stay in ANCF coordinates.
+        wp.launch(
+            gather_contact_spikes,
+            dim=self._n_envs * self._n_nodes,
+            inputs=[
+                self._node_x(),
+                self._n_nodes,
+                0.0,
+                self._contact_vis_scale,
+                1,
+                1,
+                self._contact_line_s,
+                self._contact_line_e,
+            ],
+            device="cuda:0",
+        )
+        self.viewer.log_lines("contact_spikes", self._contact_line_s, self._contact_line_e, colors=(0.0, 1.0, 1.0))
+        self.viewer.end_frame()
+
+    def test_final(self):
+        x_np = self._node_x().numpy()
+        assert not np.any(np.isnan(x_np)), "NaN in node positions"
+        assert not np.any(np.isinf(x_np)), "Inf in node positions"
+        min_y = float(x_np[:, 1].min())
+        assert min_y > -0.05, f"Excessive ground penetration: y_min={min_y:.4f}"
+
+
+if __name__ == "__main__":
+    parser = newton.examples.create_parser()
+    parser.add_argument(
+        "--tire-asset",
+        type=str,
+        default=None,
+        help=(
+            "Baked ANCF shell USD: filename under examples/assets/ or an absolute path. "
+            "Omit to choose interactively; the default is minimal_ball.usda (60 quads)."
+        ),
+    )
+    parser.add_argument("--list-assets", action="store_true", help="List discovered ANCF shell assets and exit.")
+    parser.add_argument(
+        "--n-envs",
+        type=int,
+        default=1,
+        help="Number of parallel tire environments (batched solver). Spaced 1 m apart along X.",
+    )
+    parser.add_argument(
+        "--substeps",
+        type=int,
+        default=10,
+        help="Substeps per frame. dt = 1/60/substeps.",
+    )
+    parser.add_argument(
+        "--kn",
+        type=float,
+        default=None,
+        help="Normal penalty stiffness [N/m]; defaults to the selected asset's contactKn.",
+    )
+    parser.add_argument(
+        "--contact-penetration",
+        type=float,
+        default=0.01,
+        help="Explicitly derive kn from drop energy and this penetration target [m], unless --kn is supplied.",
+    )
+    parser.add_argument(
+        "--kd", type=float, default=None, help="Normal contact damping [N·s/m]; default: tire USD contactKd."
+    )
+    parser.add_argument("--nr-iters", type=int, default=2, help="Newton-Raphson iterations per substep.")
+    parser.add_argument(
+        "--diag-period",
+        type=int,
+        default=60,
+        help="Print env-0 height / velocity diagnostics every N frames (host readback).",
+    )
+    parser.add_argument(
+        "--pcg-iters",
+        type=int,
+        default=None,
+        help="PCG iterations per NR step (default: the tire asset's recommendation).",
+    )
+    parser.add_argument(
+        "--shell-tires",
+        type=str,
+        default=None,
+        help="JSON array of per-tire configs (position, material, pressure, etc.).",
+    )
+    parser.set_defaults(
+        viewer="gl",
+        num_frames=300,
+        headless=False,
+        n_envs=1,
+        substeps=6,
+        nr_iters=3,
+        pcg_iters=200,
+        shell_tires=[
+            {
+                "_material": "The selected asset's baked shell material and nominal pressure",
+                "name": "reference",
+                "active": True,
+                "position": [0.0, 0.0, 0.0],
+                "pressure": None,
+                "E": None,
+                "nu": None,
+                "rho": None,
+                "max-gauge-pressure": 30000.0,
+                "gauge-rate": 2000.0,
+            }
+        ],
+        contact_penetration=0.01,
+    )
+    configure_drop(parser)
+    viewer, args = newton.examples.init(parser)
+    example = Example(viewer, args)
+    newton.examples.run(example, args)

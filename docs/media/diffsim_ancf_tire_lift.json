@@ -1,0 +1,19 @@
+{
+  "example": "diffsim_ancf_tire_lift",
+  "module": "newton_solver_ancf.examples.example_diffsim_ancf_tire_lift",
+  "caption": "Implicit static-equilibrium gradients fit nominal tire pressure to a synthetic target axle height; the live MuJoCo rig checks the resulting height. Dynamic trajectories are not differentiated.",
+  "arguments": [],
+  "device": "cuda:0",
+  "frames": 960,
+  "fps": 60,
+  "width": 960,
+  "height": 540,
+  "recording_wall_seconds": 66.84995026599972,
+  "playback_is_performance_benchmark": false,
+  "simulation_time": [],
+  "dependencies": {
+    "newton_solver_ancf": "0.1.0",
+    "newton": "1.7.0",
+    "warp-lang": "1.17.0+cu13"
+  }
+}

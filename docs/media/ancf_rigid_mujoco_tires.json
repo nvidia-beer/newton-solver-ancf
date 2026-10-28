@@ -1,0 +1,21 @@
+{
+  "example": "ancf_rigid_mujoco_tires",
+  "module": "newton_solver_ancf.examples.example_ancf_rigid_mujoco_tires",
+  "caption": "Four detailed Warthog tires (2,128 nodes / 2,016 quads each) roll forward and reverse at up to \u00b18 RPM while nominal pressure cycles 30 \u2192 45 \u2192 15 \u2192 30 kPa. The recording scripts only the existing manual controls; native 6/2/10 substep/Newton/PCG budgets are retained.",
+  "arguments": [
+    "--test"
+  ],
+  "device": "cuda:0",
+  "frames": 720,
+  "fps": 60,
+  "width": 960,
+  "height": 540,
+  "recording_wall_seconds": 42.87683669500075,
+  "playback_is_performance_benchmark": false,
+  "simulation_time": [],
+  "dependencies": {
+    "newton_solver_ancf": "0.1.0",
+    "newton": "1.7.0",
+    "warp-lang": "1.17.0+cu13"
+  }
+}

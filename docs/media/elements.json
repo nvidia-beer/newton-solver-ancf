@@ -1,0 +1,28 @@
+{
+  "example": "elements",
+  "module": "newton_solver_ancf.examples.example_elements",
+  "caption": "Four clamped cantilevers bend under gravity with nodal director arrows. Default geometry, stiffness and four HHT substeps are retained.",
+  "arguments": [
+    "--formulation",
+    "3243",
+    "--debug-arrows"
+  ],
+  "device": "cuda:0",
+  "frames": 240,
+  "fps": 60,
+  "width": 960,
+  "height": 540,
+  "recording_wall_seconds": 54.248547411000345,
+  "playback_is_performance_benchmark": false,
+  "simulation_time": [
+    {
+      "attribute": "sim_time",
+      "end": 3.9999999999999907
+    }
+  ],
+  "dependencies": {
+    "newton_solver_ancf": "0.1.0",
+    "newton": "1.7.0",
+    "warp-lang": "1.17.0+cu13"
+  }
+}

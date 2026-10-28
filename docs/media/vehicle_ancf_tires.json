@@ -1,0 +1,25 @@
+{
+  "example": "vehicle_ancf_tires",
+  "module": "newton_solver_ancf.examples.example_vehicle_ancf_tires",
+  "caption": "A Warthog drives on four deformable tires at up to 6 rad/s wheel command, turns left and right using differential wheel braking, then stops. This scripted preview uses the normal manual drive controls and default 6/2/10 substep/Newton/PCG budgets.",
+  "arguments": [
+    "--vehicle-asset",
+    "warthog_vehicle.usdc",
+    "--tire-asset",
+    "warthog_ancf_tire_simple.usda",
+    "--test"
+  ],
+  "device": "cuda:0",
+  "frames": 720,
+  "fps": 60,
+  "width": 960,
+  "height": 540,
+  "recording_wall_seconds": 49.85098576500059,
+  "playback_is_performance_benchmark": false,
+  "simulation_time": [],
+  "dependencies": {
+    "newton_solver_ancf": "0.1.0",
+    "newton": "1.7.0",
+    "warp-lang": "1.17.0+cu13"
+  }
+}

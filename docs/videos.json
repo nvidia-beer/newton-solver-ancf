@@ -1,0 +1,188 @@
+{
+  "elements": {
+    "frames": 240,
+    "fps": 60,
+    "args": [
+      "--formulation",
+      "3243",
+      "--debug-arrows"
+    ],
+    "label": "gravity-loaded cable, beam, shell and cubic tetrahedra",
+    "caption": "Four clamped cantilevers bend under gravity with nodal director arrows. Default geometry, stiffness and four HHT substeps are retained."
+  },
+  "baymax_drop": {
+    "frames": 180,
+    "fps": 60,
+    "args": [
+      "--test"
+    ],
+    "label": "resolution-6 elastic solid; visible mechanical cage",
+    "caption": "A filled elastic Baymax drops onto the floor, with its 84-node/204-tetrahedron mechanical cage visible around the detailed surface. No inflation."
+  },
+  "ancf_shell_drop": {
+    "frames": 240,
+    "fps": 60,
+    "args": [
+      "--test"
+    ],
+    "label": "60-quad shell ball; dynamic floor contact",
+    "caption": "The default small shell ball (62 nodes, 60 quads) drops onto a frictional plane using its authored material and unchanged 6 substeps, 3 Newton updates and 200 PCG iterations."
+  },
+  "ancf_rigid_mujoco_tires": {
+    "frames": 720,
+    "fps": 60,
+    "args": [
+      "--test"
+    ],
+    "label": "detailed Warthog tires; manual pressure controls",
+    "caption": "Four detailed Warthog tires (2,128 nodes / 2,016 quads each) roll forward and reverse at up to \u00b18 RPM while nominal pressure cycles 30 \u2192 45 \u2192 15 \u2192 30 kPa. The recording scripts only the existing manual controls; native 6/2/10 substep/Newton/PCG budgets are retained.",
+    "pressure_schedule": [
+      [
+        0,
+        30000
+      ],
+      [
+        1,
+        30000
+      ],
+      [
+        3,
+        45000
+      ],
+      [
+        4,
+        45000
+      ],
+      [
+        7,
+        15000
+      ],
+      [
+        8,
+        15000
+      ],
+      [
+        10,
+        30000
+      ],
+      [
+        12,
+        30000
+      ]
+    ],
+    "rpm_schedule": [
+      [
+        0,
+        0
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        2,
+        8
+      ],
+      [
+        4,
+        8
+      ],
+      [
+        5,
+        0
+      ],
+      [
+        6,
+        0
+      ],
+      [
+        7,
+        -8
+      ],
+      [
+        9,
+        -8
+      ],
+      [
+        10,
+        0
+      ],
+      [
+        12,
+        0
+      ]
+    ]
+  },
+  "vehicle_ancf_tires": {
+    "frames": 720,
+    "fps": 60,
+    "args": [
+      "--vehicle-asset",
+      "warthog_vehicle.usdc",
+      "--tire-asset",
+      "warthog_ancf_tire_simple.usda",
+      "--test"
+    ],
+    "label": "Warthog left/right steering with manual drive controls",
+    "caption": "A Warthog drives on four deformable tires at up to 6 rad/s wheel command, turns left and right using differential wheel braking, then stops. This scripted preview uses the normal manual drive controls and default 6/2/10 substep/Newton/PCG budgets.",
+    "drive_schedule": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        1.5,
+        6,
+        0
+      ],
+      [
+        2,
+        6,
+        1
+      ],
+      [
+        4.5,
+        6,
+        1
+      ],
+      [
+        5.5,
+        6,
+        -1
+      ],
+      [
+        9,
+        6,
+        -1
+      ],
+      [
+        9.5,
+        6,
+        0
+      ],
+      [
+        10,
+        0,
+        0
+      ],
+      [
+        12,
+        0,
+        0
+      ]
+    ]
+  },
+  "diffsim_ancf_tire_lift": {
+    "frames": 960,
+    "fps": 60,
+    "args": [],
+    "label": "static pressure optimization checked in a live rig",
+    "caption": "Implicit static-equilibrium gradients fit nominal tire pressure to a synthetic target axle height; the live MuJoCo rig checks the resulting height. Dynamic trajectories are not differentiated."
+  }
+}
